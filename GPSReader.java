@@ -24,7 +24,7 @@ public class GPSReader extends Thread implements Closeable {
     @Override 
     public void run() {
         try(BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(portName)))) {
-            
+            System.out.println(" NOTE !!!!: \nIF you see this in the lgs :\n[GPS] Error reading the port (unplugged? / no GPS?): \'dev\ttyUSB0 (The system cannot find the path specified)\nIt is caused by windows");
             System.out.println("[GPS] Listening on " + portName + " -waiting for validated fix ....");
 
             while(running) {
