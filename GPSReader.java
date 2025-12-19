@@ -1,7 +1,7 @@
 import java.io.BufferedReader;
-import java.io.FileReader;
-import java.io.InputStreamReader;
 import java.io.Closeable;
+import java.io.FileInputStream;
+import java.io.InputStreamReader;
 /*
 *Created by Ishmael D. Tembo - Lusaka , zamabia 
 *Supports Windows (COM3, COM4..) and Linus/Raspberry pi(Probably - not yet tested)
