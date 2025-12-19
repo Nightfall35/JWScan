@@ -71,4 +71,51 @@ public class GPSReader extends Thread implements Closeable {
         }catch(NumberFormatException ignore) {}
     }
 
+    private double convertToDecimalDegrees(double raw , String direction ) {
+        double degrees = Math.floor(raw / 100);
+        double minutes = raw % 100;
+        double decimal = degrees + minutes /60.0;
+
+        if("S".equalsIgnoreCase(direction) || "W".equalsIgnoreCase(direction)) {
+            return -decimal;
+        }
+        return decimal;
+    }
+
+    public double getLat() { return lat; }
+    public 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+
 }
