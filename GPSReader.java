@@ -1,11 +1,14 @@
 import java.io.BufferedReader;
 import java.io.FileReader;
 import java.io.Closeable;
-
+/*
+*Created by Ishmael D. Tembo - Lusaka , zamabia 
+*Supports Windows (COM3, COM4..) and Linus/Raspberry pi(Probably - not yet tested)
+*/
 public class GPSReader extends Thread implements Closeable {
     private volatile double lat = 0.0;
     private volatile double lon = 0.0;
-    private volatile boolean hashFix = false;
+    private volatile boolean hasFix = false;
     private volatile boolean running = true;
 
     private final String portName;
@@ -40,4 +43,32 @@ public class GPSReader extends Thread implements Closeable {
         System.out.println("[GPS] Reader thread stopped.");
     }
     
+    public void parseGGA(String sentence){
+        String[] parts = sentence.split(",");
+
+        if("0".equals(parts[6])) {
+            if(hasFix) {
+                System.out.println("[GPS] Lost fix.");
+                hasFix = false;
+            }
+            return;
+        }
+        if(parts[2].isEmpty() || parts[4].isEmpty()) return;
+
+        try {
+            double latRaw = Double.parseDouble(parts[2]);
+            double lonRaw = Double.parseDouble(parts[4]);
+
+            double newLat = convertToDecimalDegrees(latRaw, parts[3]);
+            double newLon = convertToDecimalDegrees(lonRaw, parts[5]);
+
+            this.lat = newLat;
+            this.lon = newLon;
+            this.hasFix = true;
+
+            System.out.printf("[GPS] FIX -> %.6f, %.6f, %.6f%n",lat , lon);
+
+        }catch(NumberFormatException ignore) {}
+    }
+
 }
