@@ -83,7 +83,14 @@ public class GPSReader extends Thread implements Closeable {
     }
 
     public double getLat() { return lat; }
-    public 
+    public double getLon() { return lon; }
+    public boolean hasFix() { return hasFix; }
+
+    @Override 
+    public void close() {
+        running = false;
+        this.interrupt();
+    } 
 
 
 
@@ -116,6 +123,6 @@ public class GPSReader extends Thread implements Closeable {
 
 
 
-    
+
 
 }
