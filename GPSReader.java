@@ -1,5 +1,6 @@
 import java.io.BufferedReader;
 import java.io.FileReader;
+import java.io.InputStreamReader;
 import java.io.Closeable;
 /*
 *Created by Ishmael D. Tembo - Lusaka , zamabia 
