@@ -10,6 +10,7 @@ public class OuiDatabase{
     private final String cacheFile = "oui_cache.dat";
     private final Rat rat;
     private static final String WIRESHARK_OUI_URL = "https://code.wireshark.org/review/gitweb?p=wireshark.git;a=blob_plain;f=manuf";
+    private static final String IEEE_OUI_URL = "https://standards-oui.ieee.org/oui/oui.txt";
 
     public OuiDatabase(Rat rat) {
         this.rat=rat;
@@ -160,7 +161,7 @@ public class OuiDatabase{
                     int count = 0;
 
                     while((line = reader.readLine()) != null) {
-                        if(line.contains("(hex)") {
+                        if(line.contains("(hex)")){
                             String[] parts = line.split("\t+");
                             if(parts.length >= 2) {
                                 String macPart = parts[0].trim().replace("-","").toUpperCase();
@@ -226,11 +227,11 @@ public class OuiDatabase{
         try(ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(cacheFile))) {
             oos.writeObject(ouiMap);
             rat.println("Saved " + ouiMap.size() + " OUI entries to cache");
-        }
-    }catch(Exception e) {
+        }catch(Exception e) {
         rat.println("Failed to save OUI cache: " + e.getMessage());
+         }
     }
-}
+
 
 public String lookup(String bssid) {
     if(bssid == null || bssid.isEmpty()) return "Unknown";
