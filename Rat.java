@@ -101,9 +101,14 @@ public class Rat {
     private SwarmAi ai;
     private String myMac = "00-15-5D-BF-D7-5A";
     private boolean counterMode = true;
+    private OuiDatabase ouiDatabase;
+    private WigleGeolocator geolocator;
 
     public Rat(int port) {
         this.httpPort = port;
+        this.ouiDatabase = new OuiDatabase(this);
+        this.geolocator = new WigleGeolocator(this);
+        
         loadBuiltInOuIs();
         background.submit(this::downloadAndCacheIeeeOui);
         ai = new SwarmAi(this);

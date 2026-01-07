@@ -27,7 +27,7 @@ public class WigleGeolocator {
     public WigleGeolocator(Rat rat) {
         this.rat= rat;
         loadCredentials();
-        loadCache();
+        loadGeoCache();
  
     }
     private void loadCredentials() {
@@ -99,7 +99,8 @@ public class WigleGeolocator {
             String url ="https://api.wigle.net/api/v2/network/search";
             String queryParams = String.format("newid=%s&ssid=%s",
                 URLEncoder.encode(bssid, "UTF-8"),
-                URLEncoder.encode(ssid != ? ssid: "", "UTF-8"));
+                URLEncoder.encode(ssid != ? ssid: "", "UTF-8")
+            );
 
             HttpURLConnection conn = (HttpURLConnection) new URL(url + "?" + queryParams).openConnection();
             conn.setRequestMethod("GET");
@@ -169,7 +170,7 @@ public class WigleGeolocator {
         try{
             HttpURLConnection conn =(HttpURLConnection) new URL("http://ip-api.com/json/").openConnection();
             conn.setConnectTimeout(3000);
-            BufferedReader reader = new BufferedReader(new INputStreamReader(conn.getInputStream()));
+            BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
             StringBuilder response  = new StringBuilder();
             String line;
             while((line = reader.readLine()) != null) {
