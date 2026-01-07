@@ -179,7 +179,7 @@ public class WigleGeolocator {
                 response.append(line);
             }
             JSONObject json = new JSONObject(response.toString());
-            if(json.getString("status").ewuals("success")) {
+            if(json.getString("status").equals("success")) {
                 return new GeoResult(true,
                     json.getDouble("lat"),
                     json.getDouble("lon"),
