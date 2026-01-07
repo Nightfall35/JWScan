@@ -136,7 +136,7 @@ public class WigleGeolocator {
 
                     double lat = result.getDouble("trilat");
                     double lon = result.getDouble("trilong");           
-                    int accuracy = result.opInt("accuracy", 100);
+                    int accuracy = result.optInt("accuracy", 100);
                     
                     geoCache.put(bssid, new GeoCacheEntry(lat, lon, accuracy));
                     saveGeoCache();
