@@ -170,7 +170,37 @@ public class Rat {
 		if(!first) sb.append(",");
 		first = false;
 	
-		String vendor = getVendorFromBssid(ap.bssid);
+		String vendor = ouiDatabase.lookup(ap.bssid);
+        String detailedInfo = ouiDatabase.getDetailedInfo(ap.bssid);
+
+        WigleGeolocator.GeoResult geo = geolocator.geolocate(ap.bssid, ap.ssid);
+
+        double lat, lon ;
+        if(geo.success) {
+            lat = geo.lat;
+            lon = geo.lon;
+            ap.source = geo.source;
+        }else{ 
+            WigleGeolocator.GeoResult approx = geolocator.getApproximateLocation();
+
+            if(approx.success) {
+                double offset = 0.01 * (Math.random() - 0.5);
+                lat = approx.lat + offset;
+                lon = approx.lon + offset;
+                ap.source ="Approx" + approx.source;
+            }else {
+                double baseLat = -15.3875;
+                double baseLon = 28.3228;
+                lat = baseLat + (Math.random() - 0.5) * 0.01;
+                lon = baseLon + (Math.random() - 0.5) * 0.01;
+                ap.source = "Random Jitter";
+            }
+        }
+
+        ap.lat = lat;
+        ap.lon = lon;
+
+
 		sb.append("\"").append(e.getKey()).append("\":{")
 		   .append("\"ssid\":\"").append(jsonEscape(ap.ssid)).append("\",")
 		   .append("\"bssid\":\"").append(jsonEscape(ap.bssid)).append("\",")
@@ -370,14 +400,15 @@ public class Rat {
     }
 
     public static class AP {
-        public String ssid = "<hidden>";
-        public String bssid = "";
-        public String security = "OPEN";
-        public int signal = -100;
-        public int channel = 0;
+    public String ssid = "<hidden>";
+    public String bssid = "";
+    public String security = "OPEN";
+    public int signal = -100;
+    public int channel = 0;
 	public double lat = 0.0;
 	public double lon = 0.0;
 	public long lastSeen = System.currentTimeMillis();
+    public String source = "Unknown";
     }
 
     private static final String DASHBOARD_HTML = """
@@ -464,5 +495,7 @@ evt.onmessage = e => {
     public Deauther getDeauther() {
     return deauther;
 }
+
+
 
 } 
