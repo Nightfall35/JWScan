@@ -1,0 +1,7 @@
+# Get free API key from https://wigle.net/account
+export WIGLE_API_NAME="your_username"
+export WIGLE_API_TOKEN="your_api_token"
+
+# Or create wigle_config.properties:
+# apiName=your_username
+# apiToken=your_api_token

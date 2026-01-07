@@ -471,7 +471,13 @@ evt.onmessage = e => {
             }).addTo(map);
             
             marker.bindPopup(
-                `<b>${ap.ssid}</b><br>${ap.bssid}<br>${ap.security}<br>${ap.signal}dBm<br>${ap.vendor}`
+               `<b>${ap.ssid}</b><br>
+                 <small>${ap.bssid}</small><br>
+                <b>${ap.vendor}</b><br>
+                ${ap.details}<br>
+                Security: ${ap.security}<br>
+                Signal: ${ap.signal}dBm (CH ${ap.channel})<br>
+                <i>Location source: ${ap.source}</i>`
             );
             markers[key] = marker;
         }
