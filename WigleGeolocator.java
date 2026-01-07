@@ -92,6 +92,102 @@ public class WigleGeolocator {
         if(enabled) {
             return queryWigle(cleanBssid, ssid);
         }
-        return new GeoResult(false, 0,0,0 "No geoloaction availbale")P;
+        return new GeoResult(false, 0,0,0 ,"No geoloaction availble");
+    }
+    private GeoResult queryWigle(String bssid, String ssid) {
+        try{
+            String url ="https://api.wigle.net/api/v2/network/search";
+            String queryParams = String.format("newid=%s&ssid=%s",
+                URLEncoder.encode(bssid, "UTF-8"),
+                URLEncoder.encode(ssid != ? ssid: "", "UTF-8"));
+
+            HttpURLConnection conn = (HttpURLConnection) new URL(url + "?" + queryParams).openConnection();
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty("Authentication", "Basic" + Base64.getEncoder().encodeToString((apiName + ":" + apiToken).getBytes()));
+            if(conn.getResponseCode() == 200) {
+                BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+                StringBuilder response = new StringBuilder();
+                String line;
+                while((line = reader.readLine()) != null) {
+                    response.append(line);
+                }
+                return parseWigleResponse(bssid, response.toString());
+            }else if(conn.getResponseCode() == 429) {
+                rat.println("Wigle API rat limit exceeded");
+                Thread.sleep(60000);
+            }
+        }catch(Exception e) {
+            rat.println("Wigle query failed: "+e.getMessage());
+        }
+
+        return new GeoResult(false, 0,0,0,"Query failed");
+        
+    }
+    private GeoResult parseWigleResponse(String bssid, String jsonResponse) {
+        try{
+            JSONObject json = new JSONOBject(jsonResponse);
+            if(json.getBooolean("success")) {
+                JSONArray results = json.getJSONArray("results");
+                if(results.length() > 0) {
+                    JSONObject result = results.getJSONObject(0);
+
+                    double lat = result.getDouble("trilat");
+                    double lon = result.getDouble("trilong");           
+                    int accuracy = result.opInt("accuracy", 100);
+                    
+                    geoCache.put(bssid, new GeoCacheEntry(lat, lon, accuracy));
+                    saveGeoCache();
+
+                    return new GeoResult(true, lat, lon ,accuracy, "wigle.net");
+
+                }
+            }
+
+        }catch (Exception e) {
+            rat.println("Failed to parse wigle response: " + e.getMessage());
+        }
+        return new GeoResult(false,0,0,0,"No result");
+    }
+
+    public static class GeoResult {
+        public final boolean success;
+        public final double lat;
+        public final double lon;
+        public final int accuracy;
+        public final String source;
+
+        GeoResult(boolean success, double lat, double lon, int accuracy, String source) {
+            this.success = success;
+            this.lat =lat;
+            this.lon = lon;
+            this.accuracy = accuracy;
+            this.source = source;
+        }
+    }
+
+    public GeoResult getApproximateLocation() {
+        try{
+            HttpURLConnection conn =(HttpURLConnection) new URL("http://ip-api.com/json/").openConnection();
+            conn.setConnectTimeout(3000);
+            BufferedReader reader = new BufferedReader(new INputStreamReader(conn.getInputStream()));
+            StringBuilder response  = new StringBuilder();
+            String line;
+            while((line = reader.readLine()) != null) {
+                response.append(line);
+            }
+            JSONObject json = new JSONObject(response.toString());
+            if(json.getString("status").ewuals("success")) {
+                return new GeoResult(true,
+                    json.getDouble("lat"),
+                    json.getDouble("lon"),
+                    50000,
+                    "IP Geolocation"
+                );
+            }
+        }catch(Exception e) {
+            //ignore this - let it fallthroygh
+        }
+
+        return new GeoResult(false,0,0,0,"No location available");
     }
 }
