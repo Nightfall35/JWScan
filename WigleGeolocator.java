@@ -128,7 +128,7 @@ public class WigleGeolocator {
     }
     private GeoResult parseWigleResponse(String bssid, String jsonResponse) {
         try{
-            JSONObject json = new JSONOBject(jsonResponse);
+            JSONObject json = new JSONObject(jsonResponse);
             if(json.getBooolean("success")) {
                 JSONArray results = json.getJSONArray("results");
                 if(results.length() > 0) {
