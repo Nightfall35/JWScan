@@ -99,7 +99,7 @@ public class WigleGeolocator {
             String url ="https://api.wigle.net/api/v2/network/search";
             String queryParams = String.format("newid=%s&ssid=%s",
                 URLEncoder.encode(bssid, "UTF-8"),
-                URLEncoder.encode(ssid != ? ssid: "", "UTF-8")
+                URLEncoder.encode(ssid != null? ssid: "", "UTF-8")
             );
 
             HttpURLConnection conn = (HttpURLConnection) new URL(url + "?" + queryParams).openConnection();
