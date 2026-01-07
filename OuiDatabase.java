@@ -33,7 +33,7 @@ public class OuiDatabase{
                 loadBuiltInFallback();
             }
         }else {
-            loadBuitInFallback();
+            loadBuiltInFallback();
         }
 
     }
