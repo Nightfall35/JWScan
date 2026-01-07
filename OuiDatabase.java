@@ -107,7 +107,6 @@ public class OuiDatabase{
             Map.entry("E4CE70", "Huawei"),
             Map.entry("EC9327", "TP-Link"),
             Map.entry("F48C50", "Intel"),
-            Map.entry("F81A67", "ARRIS"),
             Map.entry("FC626E", "Xiaomi")
         );
 
