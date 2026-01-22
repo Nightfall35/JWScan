@@ -32,30 +32,20 @@ public class WigleGeolocator {
         loadGeoCache();
  
     }
+   
     private void loadCredentials() {
-        apiName = System.getenv("WIGLE_API_NAME");
-        apiToken = System.getenv("Wigle_API_TOKEN");
-        if(apiName == null || apiToken == null) {
-            File config = new File("wigle_config.properties");
-            if(config.exists()) {
-                try {
-                    Properties props = new Properties();
-                    props.load(new FileInputStream(config));
-                    apiName = props.getProperty("apiName");
-                    apiToken = props.getProperty("apiToken");
-
-                }catch (Exception e) {
-                    //Ignore this 
+        File config = new File("Wigle_config.txt");
+        if(config.exists()) {
+            try{
+                List<String> lines = Files.readAllLines(config.toPath(),StandardCharsets.UTF_8);
+                for(String line : lines) {
+                    line = line.trim();
+                    if(line.startsWith("API_NAME=")){
+                        apiName = line.substring(9).trim();
+                        
+                    }   
                 }
-            }
-        }
-        enabled = apiName != null && apiToken != null && !apiName.isEmpty() && !apiToken.isEmpty();
-
-        if(enabled) {
-            rat.println("Wigle.net geolocation ENABLED");
-
-        }else {
-            rat.println("Wigle.net geolocation DISABLED (set WIGLE_API_NAME and WIGLE_API_TOKEN env vars)");
+            }catch(){}
         }
     }
 

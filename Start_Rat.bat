@@ -1,5 +1,7 @@
 start http://localhost:8080
 @echo off
+set WIGLE_API_NAME="NightFall35"
+set WIGLE_API_TOKEN="0dd81d8f68114bc26317df8cf8a3c967"
 title RAT SWARM v2 - FULL PASSIVE WARDRIVING MODE
 color 0A
 echo.

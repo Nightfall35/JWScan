@@ -411,82 +411,7 @@ public class Rat {
     public String source = "Unknown";
     }
 
-    private static final String DASHBOARD_HTML = """
-<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>RAT SWARM v2</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-<style>
-  body{margin:0;background:#000;color:#0f0;font-family:monospace;overflow:hidden}
-  #map{width:100vw;height:100vh}
-  .header{position:fixed;top:0;left:0;right:0;z-index:1000;background:#000c;padding:10px;font-size:14px;border-bottom:1px solid #0f0}
-  @keyframes blink{0%,100%{opacity:1}50%{opacity:0.3}}
-</style></head><body>
-<div class="header">
-  <strong>RAT SWARM v2</strong> | <span id="count">0</span> APs | <span id="status">Connecting...</span>
-</div>
-<div id="map"></div>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script>
-const map = L.map('map').setView([-15.3875, 28.3228], 15);  // Change to Lusaka
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
-
-const markers = {};
-let userLocationSet = false;
-
-navigator.geolocation?.watchPosition(pos => {
-    const lat = pos.coords.latitude;
-    const lon = pos.coords.longitude;
-    map.setView([lat, lon], 16);
-    if (!userLocationSet) {
-        L.marker([lat, lon]).addTo(map).bindPopup("YOU ARE HERE").openPopup();
-        userLocationSet = true;
-    }
-});
-
-const evt = new EventSource('/ws');
-evt.onopen = () => document.getElementById('status').textContent = 'LIVE';
-
-evt.onmessage = e => {
-    const d = JSON.parse(e.data);
-    if (d.type !== 'full') return;
     
-    document.getElementById('count').textContent = Object.keys(d.aps).length;
-
-    Object.entries(d.aps).forEach(([key, ap]) => {
-        if (markers[key]) {
-            // Update existing marker position & popup
-            markers[key].setLatLng([ap.lat, ap.lon]);
-            markers[key].setPopupContent(
-                `<b>${ap.ssid}</b><br>${ap.bssid}<br>${ap.security}<br>${ap.signal}dBm<br>${ap.vendor}`
-            );
-        } else {
-            // Create new marker
-            const color = ap.security.includes('OPEN') ? 'red' : 
-                         ap.signal > -65 ? 'green' : 'orange';
-            const marker = L.circleMarker([ap.lat, ap.lon], {
-                radius: 8,
-                color: color,
-                fillOpacity: 0.8
-            }).addTo(map);
-            
-            marker.bindPopup(
-               `<b>${ap.ssid}</b><br>
-                 <small>${ap.bssid}</small><br>
-                <b>${ap.vendor}</b><br>
-                ${ap.details}<br>
-                Security: ${ap.security}<br>
-                Signal: ${ap.signal}dBm (CH ${ap.channel})<br>
-                <i>Location source: ${ap.source}</i>`
-            );
-            markers[key] = marker;
-        }
-    });
-};
-</script>
-</body></html>
-""";
-
     private static class WebSocketHandshake {
         static String accept(String key) {
             String magic = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -497,7 +422,274 @@ evt.onmessage = e => {
             } catch (Exception e) { return ""; }
         }
     }
+    private static final String DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>RAT SWARM v2</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+  body {
+    margin: 0;
+    background: #000;
+    color: #0f0;
+    font-family: monospace;
+    overflow: hidden;
+  }
+  #map {
+    width: 100vw;
+    height: 100vh;
+  }
+  .header {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 1000;
+    background: rgba(0, 0, 0, 0.8);
+    padding: 10px;
+    font-size: 14px;
+    border-bottom: 1px solid #0f0;
+    backdrop-filter: blur(5px);
+  }
+  .status-connected { color: #0f0; }
+  .status-disconnected { color: #f00; }
+  .status-connecting { color: #ff0; }
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+  #ap-list {
+    position: fixed;
+    top: 50px;
+    right: 10px;
+    width: 300px;
+    max-height: 80vh;
+    overflow-y: auto;
+    background: rgba(0, 0, 0, 0.8);
+    border: 1px solid #0f0;
+    padding: 10px;
+    font-size: 12px;
+    display: none;
+  }
+  .ap-item {
+    margin: 5px 0;
+    padding: 5px;
+    border-bottom: 1px solid #333;
+  }
+  .ap-open { color: #f00; }
+  .ap-strong { color: #0f0; }
+  .ap-weak { color: #ff0; }
+</style>
+</head>
+<body>
+<div class="header">
+  <strong>RAT SWARM v2</strong> | 
+  <span id="count">0</span> APs | 
+  Status: <span id="status" class="status-connecting">Connecting...</span> |
+  <button onclick="toggleList()">Show List</button>
+</div>
+<div id="map"></div>
+<div id="ap-list">
+  <h4>Access Points</h4>
+  <div id="ap-list-content"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map = L.map('map').setView([-15.3875, 28.3228], 15);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; OpenStreetMap contributors'
+}).addTo(map);
+
+const markers = {};
+let userLocationSet = false;
+let apListVisible = false;
+
+if (navigator.geolocation) {
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      const lat = pos.coords.latitude;
+      const lon = pos.coords.longitude;
+      map.setView([lat, lon], 16);
+      L.marker([lat, lon])
+        .addTo(map)
+        .bindPopup("<b>YOU ARE HERE</b>")
+        .openPopup();
+      userLocationSet = true;
+    },
+    (err) => {
+      console.log('Geolocation error:', err.message);
+    },
+    { timeout: 5000 }
+  );
+}
+
+let evt = null;
+let reconnectAttempts = 0;
+const maxReconnectAttempts = 10;
+const reconnectDelay = 2000;
+
+function connectToServer() {
+  const statusEl = document.getElementById('status');
+  
+  if (evt) {
+    evt.close();
+  }
+  
+  statusEl.textContent = 'Connecting...';
+  statusEl.className = 'status-connecting';
+  
+  try {
+    evt = new EventSource('/ws');
     
+    evt.onopen = () => {
+      statusEl.textContent = 'LIVE';
+      statusEl.className = 'status-connected';
+      reconnectAttempts = 0;
+      console.log('Connected to RAT server');
+    };
+    
+    evt.onmessage = (e) => {
+      try {
+        const d = JSON.parse(e.data);
+        if (d.type === 'full') {
+          updateDisplay(d.aps);
+        }
+      } catch (parseError) {
+        console.error('Error parsing JSON:', parseError);
+      }
+    };
+    
+    evt.onerror = (err) => {
+      statusEl.textContent = 'Disconnected';
+      statusEl.className = 'status-disconnected';
+      console.error('EventSource error:', err);
+      
+      evt.close();
+      
+      if (reconnectAttempts < maxReconnectAttempts) {
+        reconnectAttempts++;
+        console.log('Reconnecting in ' + reconnectDelay + 'ms (attempt ' + reconnectAttempts + '/' + maxReconnectAttempts + ')');
+        setTimeout(connectToServer, reconnectDelay);
+      } else {
+        statusEl.textContent = 'Failed to connect';
+        console.error('Max reconnection attempts reached');
+      }
+    };
+    
+  } catch (error) {
+    console.error('Failed to create EventSource:', error);
+    statusEl.textContent = 'Connection failed';
+    statusEl.className = 'status-disconnected';
+    
+    if (reconnectAttempts < maxReconnectAttempts) {
+      reconnectAttempts++;
+      setTimeout(connectToServer, reconnectDelay);
+    }
+  }
+}
+
+function updateDisplay(aps) {
+  const countEl = document.getElementById('count');
+  const listContent = document.getElementById('ap-list-content');
+  
+  countEl.textContent = Object.keys(aps).length;
+  
+  if (apListVisible) {
+    listContent.innerHTML = '';
+  }
+  
+  Object.entries(aps).forEach(([key, ap]) => {
+    let color = 'orange';
+    let radius = 8;
+    
+    if (ap.security && ap.security.includes('OPEN')) {
+      color = 'red';
+      radius = 10;
+    } else if (ap.signal > -65) {
+      color = 'green';
+    }
+    
+    if (markers[key]) {
+      markers[key].setLatLng([ap.lat, ap.lon]);
+      markers[key].setStyle({ color: color, radius: radius });
+      markers[key].setPopupContent(createPopupContent(ap));
+    } else {
+      const marker = L.circleMarker([ap.lat, ap.lon], {
+        radius: radius,
+        color: color,
+        fillColor: color,
+        fillOpacity: 0.7,
+        weight: 2
+      }).addTo(map);
+      
+      marker.bindPopup(createPopupContent(ap));
+      markers[key] = marker;
+      
+      if (apListVisible) {
+        const apItem = document.createElement('div');
+        apItem.className = 'ap-item';
+        if (color === 'red') apItem.classList.add('ap-open');
+        else if (color === 'green') apItem.classList.add('ap-strong');
+        else apItem.classList.add('ap-weak');
+        
+        apItem.innerHTML = '<strong>' + ap.ssid + '</strong><br>' +
+                           '<small>' + ap.bssid + '</small><br>' +
+                           'Sig: ' + ap.signal + 'dBm | Ch: ' + ap.channel + ' | ' + ap.security + '<br>' +
+                           'Vendor: ' + ap.vendor;
+        listContent.appendChild(apItem);
+      }
+    }
+  });
+  
+  Object.keys(markers).forEach(key => {
+    if (!aps[key]) {
+      map.removeLayer(markers[key]);
+      delete markers[key];
+    }
+  });
+}
+
+function createPopupContent(ap) {
+  return '<div style="font-family: monospace; font-size: 12px;">' +
+         '<strong>' + ap.ssid + '</strong><br>' +
+         '<small>' + ap.bssid + '</small><br>' +
+         '<hr style="margin: 5px 0; border-color: #333;">' +
+         '<b>Security:</b> ' + ap.security + '<br>' +
+         '<b>Signal:</b> ' + ap.signal + 'dBm<br>' +
+         '<b>Channel:</b> ' + ap.channel + '<br>' +
+         '<b>Vendor:</b> ' + ap.vendor + '<br>' +
+         '<b>Coordinates:</b> ' + ap.lat.toFixed(6) + ', ' + ap.lon.toFixed(6) +
+         '</div>';
+}
+
+function toggleList() {
+  const listEl = document.getElementById('ap-list');
+  apListVisible = !apListVisible;
+  
+  if (apListVisible) {
+    listEl.style.display = 'block';
+  } else {
+    listEl.style.display = 'none';
+  }
+}
+
+connectToServer();
+
+map.on('click', (e) => {
+  console.log('Map clicked at:', e.latlng);
+});
+
+setInterval(() => {
+  if (evt && evt.readyState === EventSource.CLOSED) {
+    console.log('Connection closed, attempting reconnect...');
+    connectToServer();
+  }
+}, 30000);
+</script>
+</body>
+</html>
+""";
     public Deauther getDeauther() {
     return deauther;
 }

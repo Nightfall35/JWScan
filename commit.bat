@@ -1,0 +1,1 @@
+javac -encoding UTF-8 -cp "pcap4j-core-1.8.2.jar;pcap4j-packetfactory-static-1.8.2.jar;json-20210307.jar" *.java
