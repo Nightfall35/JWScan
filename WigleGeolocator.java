@@ -55,6 +55,22 @@ public class WigleGeolocator {
             }catch(Exception e){
                 rat.println("Failed to load Wigle credentials: "+ e.getMessage());
             }
+
+        }
+        if(apiName == null || apiToken.isEmpty()) {
+            apiName = System.getenv("WIGLE_API_NAME");
+
+        }
+        if(apiToken == null || apiToken.isEmpty()) {
+            apiToken = System.getenv("WIGLE_API_TOKEN");
+        }
+
+        enabled = apiName != null && apiToken != null && !apiName.isEmpty() && !apiToken.isEmpty();
+        if(enabled){
+            rat.println("Wigle.net geolocation ENABLED for user: " + apiName);
+
+        }else {
+            ray.println("Wigle.net geolocation DISABLED - missing credentials");
         }
     }
 
