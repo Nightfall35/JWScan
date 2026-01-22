@@ -42,10 +42,19 @@ public class WigleGeolocator {
                     line = line.trim();
                     if(line.startsWith("API_NAME=")){
                         apiName = line.substring(9).trim();
-                        
+
+                    }else if(line.startsWith("API_TOKEN=")){
+                        apiToken=line.substring(10).trim();
                     }   
                 }
-            }catch(){}
+                rat.println("loaded Wigle credentials from config file");
+                if(apiName != null && apiToken != null) {
+                    enabled = true;
+                    rat.println("Wigle geolocation enabled");
+                }
+            }catch(Exception e){
+                rat.println("Failed to load Wigle credentials: "+ e.getMessage());
+            }
         }
     }
 
