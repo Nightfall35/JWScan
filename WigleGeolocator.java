@@ -70,7 +70,8 @@ public class WigleGeolocator {
             rat.println("Wigle.net geolocation ENABLED for user: " + apiName);
 
         }else {
-            ray.println("Wigle.net geolocation DISABLED - missing credentials");
+            rat.println("Wigle.net geolocation DISABLED - missing credentials");
+            rat.println("Set WIGLE_API_NAME and WIGLE_API_TOEKEN env");
         }
     }
 
