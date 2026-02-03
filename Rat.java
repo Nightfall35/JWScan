@@ -145,6 +145,7 @@ public class Rat {
     private void broadcastFullUpdate() {
         if (websocketClients.isEmpty()) return;
         String json = buildFullJson();
+        println("Broadcasting to " + websocketClients.size() + " clients: " + json.substring(0, Math.min(100, json.length())) + "...");
         Iterator<HttpExchange> it = websocketClients.iterator();
         while (it.hasNext()) {
             HttpExchange ex = it.next();
@@ -153,7 +154,7 @@ public class Rat {
 		ex.getResponseBody().write(msg.getBytes(StandardCharsets.UTF_8));
 		ex.getResponseBody().flush();
             } catch (Exception e) {
-                it.remove();
+                websocketClients.remove(ex);
                 try { ex.close(); } catch (Exception ignored) {}
             }
         }
@@ -232,6 +233,7 @@ public class Rat {
 	if(existing == null) {
 		seenById.put(id,ap);
 		printlnAlert("NEW AP -> " +summarize(ap));
+        println("Total APs in memory "+ seenById.size());
 		if(isOpen(ap)) {
 			printlnStrongAlert("OPEN NETWORK -> " + ap.ssid);
 			soundBell();
@@ -281,31 +283,73 @@ public class Rat {
             httpServer = HttpServer.create(new InetSocketAddress(httpPort), 0);
 
             httpServer.createContext("/ws", exchange -> {
-		if(!"GET".equals(exchange.getRequestMethod())) {
-			exchange.sendResponseHeaders(405, -1);
-			return;
-		}
+                String path = exchange.getRequestURI().getPath();
+
+                if(path.equals("/") || path.equals("/index.html")){
+                        if(!"GET".equals(exchange.getRequestMethod())) {
+                            byte[]html = DASHBOARD_HTML.getBytes(StandardCharsets.UTF_8);
+                            exchange.getResponseHeaders().set("Content-Type","text/html; charset=utf-8");   
+                            exchange.sendResponseHeaders(200,html.length);
+                            exchange.getResponseBody().write(html);
+                            exchange.getResponseBody().close();
+			                
+		                }else{ exchange.sendResponseHeaders(405, -1);}
+
+                }else{
+                     exchange.sendResponseHeaders(405, -1);
+                }
+                exchange.close();
+            });
+		
+            httpServer.createContext("/sse", exchange -> {
+                if(!"GET".equals(exchange.getRequestMethod())){
+                    exchange.sendResponseHeaders(405,-1);
+                    exchange.close();
+                    return;
+                }
 
 		Headers h =exchange.getResponseHeaders();
 		h.set("Content-Type","text/event-stream");
 		h.set("Cache-Control","no-cache");
 		h.set("Connection","keep-alive");
+        h.set("Access-Control-Allow-Origin","*");
+        exchange.sendResponseHeaders(200,0);
+        OutputStream os=exchange.getResponseBody();
 
-		exchange.sendResponseHeaders(200,0);
-	
+        try{
+		   
+		    os.write(": connected\n\n".getBytes(StandardCharsets.UTF_8));
+		    os.flush();
+            websocketClients.add(exchange);
+            println("Debug:  sent initial sse message");
+        }catch(Exception e){
+            println("Debug: Error sending initial message: "+e.getMessage());
+        }
 		websocketClients.add(exchange);
+        println("DEBUG: Total SSE clients: "+ websocketClients.size());
 	    });
 
             httpServer.createContext("/", exchange -> {
-                if ("GET".equals(exchange.getRequestMethod())) {
-                    byte[] html = DASHBOARD_HTML.getBytes(StandardCharsets.UTF_8);
-                    exchange.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
-                    exchange.sendResponseHeaders(200, html.length);
-                    exchange.getResponseBody().write(html);
-                    exchange.close();
-                } else {
-                    exchange.sendResponseHeaders(405, -1);
-                }
+              if(!"GET".equals(exchange.getRequestMethod())){
+                exchange.sendResponseHeaders(405,-1);
+                return;
+              }
+              Headers h = exchange.getResponseHeaders();
+              h.set("Content-Type", "text/event-stream");
+              h.set("Cache-Control","no-cache");
+              h.set("Connection","keep-alive");
+              h.set("Access-Control-Aloow-Origin","*");
+              exchange.sendResponseHeaders(200,0);
+              OutputStream os=exchange.getResponseBody();
+
+              try{
+                os.write(":connected\n\n".getBytes(StandardCharsets.UTF_8));
+                os.flush();
+                websocketClients.add(exchange);
+              }catch(Exception e){
+                e.printStackTrace();
+                try{ exchange.close(); }catch(Exception ignored){}
+              }
             });
 
             httpServer.setExecutor(Executors.newCachedThreadPool());
