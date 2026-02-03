@@ -566,7 +566,7 @@ function connectToServer() {
   statusEl.className = 'status-connecting';
   
   try {
-    evt = new EventSource('/ws');
+    evt = new EventSource('/sse');
     
     evt.onopen = () => {
       statusEl.textContent = 'LIVE';
