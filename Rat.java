@@ -282,11 +282,13 @@ public class Rat {
         try {
             httpServer = HttpServer.create(new InetSocketAddress(httpPort), 0);
 
-            httpServer.createContext("/ws", exchange -> {
+            httpServer.createContext("/", exchange -> {
                 String path = exchange.getRequestURI().getPath();
-
+                println("Http REQUEST : "+exchange.getRequestMethod() + " "+ path);
                 if(path.equals("/") || path.equals("/index.html")){
-                        if(!"GET".equals(exchange.getRequestMethod())) {
+
+                        if("GET".equals(exchange.getRequestMethod())) {
+                            println("Serving dashboard HTML to " + exchange.getRemoteAddress());
                             byte[]html = DASHBOARD_HTML.getBytes(StandardCharsets.UTF_8);
                             exchange.getResponseHeaders().set("Content-Type","text/html; charset=utf-8");   
                             exchange.sendResponseHeaders(200,html.length);
@@ -296,12 +298,14 @@ public class Rat {
 		                }else{ exchange.sendResponseHeaders(405, -1);}
 
                 }else{
+                     println("404 for path: "+path); 
                      exchange.sendResponseHeaders(405, -1);
                 }
                 exchange.close();
             });
 		
             httpServer.createContext("/sse", exchange -> {
+                println("New SSE connection from " + exchange.getRemoteAddress());
                 if(!"GET".equals(exchange.getRequestMethod())){
                     exchange.sendResponseHeaders(405,-1);
                     exchange.close();
@@ -324,39 +328,17 @@ public class Rat {
             println("Debug:  sent initial sse message");
         }catch(Exception e){
             println("Debug: Error sending initial message: "+e.getMessage());
+            websocketClients.remove(exchange);
+            try{ exchange.close(); }catch(Exception ignored){}
         }
-		websocketClients.add(exchange);
-        println("DEBUG: Total SSE clients: "+ websocketClients.size());
+		
 	    });
-
-            httpServer.createContext("/", exchange -> {
-              if(!"GET".equals(exchange.getRequestMethod())){
-                exchange.sendResponseHeaders(405,-1);
-                return;
-              }
-              Headers h = exchange.getResponseHeaders();
-              h.set("Content-Type", "text/event-stream");
-              h.set("Cache-Control","no-cache");
-              h.set("Connection","keep-alive");
-              h.set("Access-Control-Aloow-Origin","*");
-              exchange.sendResponseHeaders(200,0);
-              OutputStream os=exchange.getResponseBody();
-
-              try{
-                os.write(":connected\n\n".getBytes(StandardCharsets.UTF_8));
-                os.flush();
-                websocketClients.add(exchange);
-              }catch(Exception e){
-                e.printStackTrace();
-                try{ exchange.close(); }catch(Exception ignored){}
-              }
-            });
-
-            httpServer.setExecutor(Executors.newCachedThreadPool());
-            httpServer.start();
-            println("Web dashboard → http://localhost:" + httpPort);
-        } catch (Exception e) {
-            e.printStackTrace();
+        httpServer.setExecutor(Executors.newCachedThreadPool());
+        httpServer.start();
+        println("Web dashboard started on -> http://localhost:" + httpPort);
+        println("WebSocket endpoint -> ws://localhost:" + httpPort + "/ws");
+        } catch (IOException e) {
+            println("Failed to start HTTP server: " + e.getMessage());
         }
     }
 
