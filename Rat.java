@@ -326,10 +326,23 @@ public class Rat {
 		    os.flush();
             websocketClients.add(exchange);
             println("Debug:  sent initial sse message");
+
+            while(!Thread.currentThread().isInterrupted()) {
+                try{
+                    Thread.sleep(15000);
+                    os.write(": heartbeat\n\n".getBytes(StandardCharsets.UTF_8));
+                    os.flush();
+
+                }catch(IOException e) {
+                    break;
+                }
+            }
         }catch(Exception e){
             println("Debug: Error sending initial message: "+e.getMessage());
+
+        }finally{
             websocketClients.remove(exchange);
-            try{ exchange.close(); }catch(Exception ignored){}
+            try { exchange.close();}catch(Exception ignored){}
         }
 		
 	    });
