@@ -170,14 +170,16 @@ public class Rat {
 		if(now - ap.lastSeen > 3000000) continue;
 		if(!first) sb.append(",");
 		first = false;
-	
+	    String key = e.getKey();
 		String vendor = ouiDatabase.lookup(ap.bssid);
-        String detailedInfo = ouiDatabase.getDetailedInfo(ap.bssid);
+        if(vendor == null) vendor = getVendorFromBssid(ap.bssid);
+        if(vendor == null) vendor = "unknown";
 
         WigleGeolocator.GeoResult geo = geolocator.geolocate(ap.bssid, ap.ssid);
 
         double lat, lon ;
-        if(geo.success) {
+        
+        if(geo.success && geo!=null){
             lat = geo.lat;
             lon = geo.lon;
             ap.source = geo.source;
@@ -185,7 +187,7 @@ public class Rat {
             WigleGeolocator.GeoResult approx = geolocator.getApproximateLocation();
 
             if(approx.success) {
-                double offset = 0.01 * (Math.random() - 0.5);
+                double offset = 0.03* (Math.random() - 0.5);
                 lat = approx.lat + offset;
                 lon = approx.lon + offset;
                 ap.source ="Approx" + approx.source;
