@@ -185,7 +185,7 @@ public class Rat {
         WigleGeolocator.GeoResult geo = geolocator.geolocate(ap.bssid, ap.ssid);
 
         double lat, lon ;
-        
+        lat = (lon =0);
         if(geo.success ){
             lat = geo.lat;
             lon = geo.lon;
@@ -206,12 +206,12 @@ public class Rat {
                 lon = baseLon + (Math.random() - 0.5) * 0.01;
                 ap.source = "Random Jitter";
             }
-        }else{
+        }
 
              ap.lat = lat;
              ap.lon = lon;
              ap.positionRandom = true;
-        }
+        
 
 		sb.append("\"").append(e.getKey()).append("\":{")
 		   .append("\"ssid\":\"").append(jsonEscape(ap.ssid)).append("\",")
@@ -506,6 +506,14 @@ public class Rat {
   .status-connected { color: #0f0; }
   .status-disconnected { color: #f00; }
   .status-connecting { color: #ff0; }
+  @keyframes pulse{
+    0% { transform: scale(1); opacity: 0.6; }
+    70%{transform: scale(1.6); opacity: 0;}
+    100% { transform: scale(1.8); opacity:0;}
+  }
+  .pulsing-open{
+    animation: pulse 2s infinite;
+  }
   @keyframes blink {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.3; }
@@ -696,6 +704,17 @@ function updateDisplay(aps) {
         fillOpacity: 0.7,
         weight: 2
       }).addTo(map);
+
+      if(ap.security && ap.security.includes('OPEN')){
+      L.circleMaker([ap.lat,ap.lon], {
+      radius: radius + 8,
+      color: '#f00',
+      fillcolor: 'transparent',
+      weight: 2,
+      opacity: 0.6,
+      className: 'pulsing-open'
+}).addTo(map);
+    }
       
       marker.bindPopup(createPopupContent(ap));
       markers[key] = marker;
