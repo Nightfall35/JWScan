@@ -145,17 +145,24 @@ public class Rat {
     private void broadcastFullUpdate() {
         if (websocketClients.isEmpty()) return;
         String json = buildFullJson();
+        String msg ="data: " +json +"\n\n";
+
         println("Broadcasting to " + websocketClients.size() + " clients: " + json.substring(0, Math.min(100, json.length())) + "...");
         Iterator<HttpExchange> it = websocketClients.iterator();
         while (it.hasNext()) {
             HttpExchange ex = it.next();
             try {
-               	String msg ="data: " +json+ "\n\n";
-		ex.getResponseBody().write(msg.getBytes(StandardCharsets.UTF_8));
-		ex.getResponseBody().flush();
-            } catch (Exception e) {
+                OutputStream os =ex.getResponseBody();
+                os.write(msg.getBytes(StandardCharsets.UTF_8));
+                os.flush();
+            } catch (IOException e) {
                 websocketClients.remove(ex);
                 try { ex.close(); } catch (Exception ignored) {}
+                println("Removed dead sse client");
+            }catch(Exception e){
+                println("Unexpected SSE write error: "+e);
+                websocketClients.remove(ex);
+                try{ex.close();}catch(Exception ignored) {}
             }
         }
     }
@@ -332,6 +339,7 @@ public class Rat {
             while(!Thread.currentThread().isInterrupted()) {
                 try{
                     Thread.sleep(15000);
+                    String heartbeat = ":heartbeat\n\n";
                     os.write(": heartbeat\n\n".getBytes(StandardCharsets.UTF_8));
                     os.flush();
 
@@ -629,7 +637,13 @@ function connectToServer() {
     }
   }
 }
-
+function toggleList() {
+ apListVisible = !apListVisible;
+ const list = document.getElementById('ap-list');
+   const btn = document.querySelector('.header button');
+ list.style.display = apListVisible ? 'block' : 'none';
+ btn.textContent = apListVisisble? 'Hide List' : 'Show List';
+}
 function updateDisplay(aps) {
   const countEl = document.getElementById('count');
   const listContent = document.getElementById('ap-list-content');
@@ -638,6 +652,22 @@ function updateDisplay(aps) {
   
   if (apListVisible) {
     listContent.innerHTML = '';
+    Object.entries(aps).forEach(([key,ap]) => {
+        const apItem = document.createElement('div');
+        apItem.clasName = 'ap-item';
+        
+        let securityColor = ap.security?.includes('OPEN') ? 'style="color:#f66;"':'';
+        let signalClass = ap.signal > -65 ? 'ap-strong' : (ap.signal > -85? 'ap-weak' : '');
+        
+        apItem.innerHTML = '
+            <strong>${ap.ssid || '&lt;hidden;'}</strong><br>
+            <span style="color:#888;">${ap.bssid}</span><br>
+            ${ap.vendor || '?'} . ch ${ap.channel} . <span class="${signalClass}">${ap.signal} dBM</span><br>
+            <span ${securityColor}>sec: ${ap.security || 'OPEN'}</span> . ${ap.source || 'Unknown'}
+        ';
+        
+        listContent.appendChild(apItem);
+    });
   }
   
   Object.entries(aps).forEach(([key, ap]) => {
