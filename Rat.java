@@ -186,11 +186,12 @@ public class Rat {
 
         double lat, lon ;
         
-        if(geo.success && geo!=null){
+        if(geo.success ){
             lat = geo.lat;
             lon = geo.lon;
             ap.source = geo.source;
-        }else{ 
+            ap.positionRandom = false;
+        }else if(!ap.positionRandom){ 
             WigleGeolocator.GeoResult approx = geolocator.getApproximateLocation();
 
             if(approx.success) {
@@ -205,11 +206,12 @@ public class Rat {
                 lon = baseLon + (Math.random() - 0.5) * 0.01;
                 ap.source = "Random Jitter";
             }
+        }else{
+
+             ap.lat = lat;
+             ap.lon = lon;
+             ap.positionRandom = true;
         }
-
-        ap.lat = lat;
-        ap.lon = lon;
-
 
 		sb.append("\"").append(e.getKey()).append("\":{")
 		   .append("\"ssid\":\"").append(jsonEscape(ap.ssid)).append("\",")
@@ -359,7 +361,7 @@ public class Rat {
         httpServer.setExecutor(Executors.newCachedThreadPool());
         httpServer.start();
         println("Web dashboard started on -> http://localhost:" + httpPort);
-        println("WebSocket endpoint -> ws://localhost:" + httpPort + "/ws");
+        //println("WebSocket endpoint -> ws://localhost:" + httpPort + "/ws");
         } catch (IOException e) {
             println("Failed to start HTTP server: " + e.getMessage());
         }
@@ -456,6 +458,7 @@ public class Rat {
     public int channel = 0;
 	public double lat = 0.0;
 	public double lon = 0.0;
+    public boolean positionRandom=false;
 	public long lastSeen = System.currentTimeMillis();
     public String source = "Unknown";
     }
