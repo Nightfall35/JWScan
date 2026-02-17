@@ -182,37 +182,30 @@ public class Rat {
         if(vendor == null) vendor = getVendorFromBssid(ap.bssid);
         if(vendor == null) vendor = "unknown";
 
-        WigleGeolocator.GeoResult geo = geolocator.geolocate(ap.bssid, ap.ssid);
+        if(!ap.positionRandom){
+             WigleGeolocator.GeoResult geo = geolocator.geolocate(ap.bssid, ap.ssid);
 
-        double lat, lon ;
-        lat = (lon =0);
-        if(geo.success ){
-            lat = geo.lat;
-            lon = geo.lon;
-            ap.source = geo.source;
-            ap.positionRandom = false;
-        }else if(!ap.positionRandom){ 
-            WigleGeolocator.GeoResult approx = geolocator.getApproximateLocation();
-
-            if(approx.success) {
-                double offset = 0.03* (Math.random() - 0.5);
-                lat = approx.lat + offset;
-                lon = approx.lon + offset;
-                ap.source ="Approx" + approx.source;
-            }else {
-                double baseLat = -15.3875;
-                double baseLon = 28.3228;
-                lat = baseLat + (Math.random() - 0.5) * 0.01;
-                lon = baseLon + (Math.random() - 0.5) * 0.01;
-                ap.source = "Random Jitter";
+            if(geo.success) {
+                ap.lat = geo.lat;
+                ap.lon = geo.lon;
+                ap.source = geo.source;
+                ap.positionRandom = false;
+            }else{
+                WigleGeolocator.GeoResult approx = geolocator.getApproximateLocation();
+                if(approx.success){
+                    double offset = 0.03* (Math.random() - 0.5);
+                    ap.lat = approx.lat + offset;
+                    ap.lon = approx.lon + offset;
+                    ap.source ="Approx" + approx.source;
+                }else {
+                    ap.lat = -15.3875 + (Math.random() - 0.5) * 0.01;
+                    ap.lon = 28.3228 + (Math.random() - 0.5) * 0.01;
+                    ap.source = "Random Jitter";
+                }
+                ap.positionRandom = true;
             }
-        }
 
-             ap.lat = lat;
-             ap.lon = lon;
-             ap.positionRandom = true;
-        
-
+       }
 		sb.append("\"").append(e.getKey()).append("\":{")
 		   .append("\"ssid\":\"").append(jsonEscape(ap.ssid)).append("\",")
 		   .append("\"bssid\":\"").append(jsonEscape(ap.bssid)).append("\",")
