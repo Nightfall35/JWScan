@@ -215,6 +215,7 @@ public class Rat {
 		   .append("\"vendor\":\"").append(jsonEscape(vendor != null ? vendor :"unknown")).append("\",")
 		   .append("\"lat\":").append(ap.lat).append(",")
 		   .append("\"lon\":").append(ap.lon)
+           .append("\"source\":\"").append(jsonEscape(ap.source)).append("\"")
 		   .append("}");
 	}
 	sb.append("}}");
