@@ -171,6 +171,7 @@ public class Rat {
 	StringBuilder sb = new StringBuilder("{\"type\":\"full\",\"aps\":{");
 	boolean first = true;
 	long now = System.currentTimeMillis();
+    
 	for(Map.Entry<String, AP> e : seenById.entrySet()) {
 		AP ap = e.getValue();
 		
@@ -186,6 +187,7 @@ public class Rat {
              WigleGeolocator.GeoResult geo = geolocator.geolocate(ap.bssid, ap.ssid);
 
             if(geo.success) {
+                if(ap.lat==-0.0 && ap.lon==0.0) continue;
                 ap.lat = geo.lat;
                 ap.lon = geo.lon;
                 ap.source = geo.source;
@@ -233,6 +235,7 @@ public class Rat {
 	double jitterLon =(Math.random() - 0.5) * 0.01;
 	ap.lat = baseLat + jitterLat;
 	ap.lon = baseLon + jitterLon;
+    ap.positionRandom = true;
 	ap.lastSeen = System.currentTimeMillis();
 
 	if(existing == null) {
@@ -450,8 +453,8 @@ public class Rat {
     public String security = "OPEN";
     public int signal = -100;
     public int channel = 0;
-	public double lat = 0.0;
-	public double lon = 0.0;
+	public double lat = -15.3875;
+	public double lon =  28.3228;
     public boolean positionRandom=false;
 	public long lastSeen = System.currentTimeMillis();
     public String source = "Unknown";
