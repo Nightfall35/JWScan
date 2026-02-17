@@ -648,13 +648,7 @@ function connectToServer() {
     }
   }
 }
-function toggleList() {
- apListVisible = !apListVisible;
- const list = document.getElementById('ap-list');
-   const btn = document.querySelector('.header button');
- list.style.display = apListVisible ? 'block' : 'none';
- btn.textContent = apListVisisble? 'Hide List' : 'Show List';
-}
+
 function updateDisplay(aps) {
   const countEl = document.getElementById('count');
   const listContent = document.getElementById('ap-list-content');
@@ -665,17 +659,17 @@ function updateDisplay(aps) {
     listContent.innerHTML = '';
     Object.entries(aps).forEach(([key,ap]) => {
         const apItem = document.createElement('div');
-        apItem.clasName = 'ap-item';
+        apItem.className = 'ap-item';
         
         let securityColor = ap.security?.includes('OPEN') ? 'style="color:#f66;"':'';
         let signalClass = ap.signal > -65 ? 'ap-strong' : (ap.signal > -85? 'ap-weak' : '');
         
-        apItem.innerHTML = '
-            <strong>${ap.ssid || '&lt;hidden;'}</strong><br>
+        apItem.innerHTML = `
+            <strong>${ap.ssid || '&lt;hidden&gt;'}</strong><br>
             <span style="color:#888;">${ap.bssid}</span><br>
             ${ap.vendor || '?'} . ch ${ap.channel} . <span class="${signalClass}">${ap.signal} dBM</span><br>
             <span ${securityColor}>sec: ${ap.security || 'OPEN'}</span> . ${ap.source || 'Unknown'}
-        ';
+        `;
         
         listContent.appendChild(apItem);
     });
@@ -706,10 +700,10 @@ function updateDisplay(aps) {
       }).addTo(map);
 
       if(ap.security && ap.security.includes('OPEN')){
-      L.circleMaker([ap.lat,ap.lon], {
+      L.circleMarker([ap.lat,ap.lon], {
       radius: radius + 8,
       color: '#f00',
-      fillcolor: 'transparent',
+      fillColor: 'transparent',
       weight: 2,
       opacity: 0.6,
       className: 'pulsing-open'
