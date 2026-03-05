@@ -1,4 +1,31 @@
-/** ===============================R.A.T (NOT A REMOTE ACCESS TROJAN : JUST THOUGHT OF AN ACTUAL RAT THAT WAS CRAWLING THROUGH MY CEILING HENCE THE NAME... NOTHING SPECIAL TO IT==========
+/**
+ * RAT SWARM v2 (BLACK ICE v2)
+ * A pure-Java, zero-dependency 802.11 surveillance lattice that turns any monitor-mode Wi-Fi adapter
+ * into a real-time city-scale RF intelligence platform.
+ *
+ * Author: Ishmael D. Tembo (Nightfall35)
+ * GitHub: https://github.com/Nightfall35
+ * Email: ishamelgoku@gmail.com
+ * Created: January 3rd - November 27th, 2025
+ *
+ * Disclaimer: This tool is for authorized security research, education, and testing on networks
+ * you own or have explicit written permission to analyze. Active transmission features are disabled
+ * by default and must only be used where legally permitted.
+ *
+ * Features:
+ * - Passively captures every 802.11 frame in range (beacons, probes, deauths)
+ * - Builds a live, breathing map of the invisible Wi-Fi layer around you
+ * - Instantly identifies open networks, rogue APs, and evil twins
+ * - Autonomously defends against deauthentication attacks
+ * - Displays everything on a dystopian cyberpunk dashboard at http://localhost:8080
+ *
+ * Technologies Used:
+ * - Pcap4j + Npcap/libpcap (raw packet access)
+ * - JDK’s built-in com.sun.net.httpserver (no Node.js, no Python, no bloat)
+ *
+ * Runs anywhere Java runs — Windows, Linux, Raspberry Pi, even Android with Termux + root.
+ * No external tools, no Python, no aircrack. Just Java and an Alfa card for total RF domination.
+ */
 *
 *
 *
@@ -98,11 +125,11 @@ public class Rat {
     private Deauther deauther = null;
     private final Map<String, String> ouiMap = new ConcurrentHashMap<>();
     private final CopyOnWriteArrayList<HttpExchange> websocketClients = new CopyOnWriteArrayList<>();
-    private SwarmAi ai;
-    private String myMac = "00-15-5D-BF-D7-5A";
+    private final SwarmAi ai;
+    private final String myMac = "00-15-5D-BF-D7-5A";
     private boolean counterMode = true;
-    private OuiDatabase ouiDatabase;
-    private WigleGeolocator geolocator;
+    private final OuiDatabase ouiDatabase;
+    private final WigleGeolocator geolocator;
 
     public Rat(int port) {
         this.httpPort = port;
