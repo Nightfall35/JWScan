@@ -1,4 +1,5 @@
 
+/*  this whole class is now obselete . only activate to test location 
 public class GPSTest {
     public static void main(String[] args) {
         try {
@@ -20,3 +21,4 @@ public class GPSTest {
         }
     }
 }
+    */

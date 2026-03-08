@@ -1,81 +1,118 @@
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.ConcurrentHashMap;
 
-
+/*
+ * SwarmAi — Evil twin / rogue AP detection engine.
+ *
+ * FIX: Original logic marked the FIRST-SEEN BSSID as "legitimate" which
+ * caused false positives constantly (rogue seen first → real AP flagged).
+ *
+ * New approach:
+ *   - Build a frequency map: SSID → (BSSID → seen count)
+ *   - The BSSID with the HIGHEST observation count is "legitimate"
+ *   - Only flag evil twins after MIN_OBSERVATIONS to avoid cold-start noise
+ *   - Deduplicate alerts with alreadyNuked set (unchanged)
+ *   - evilTwinDetected() lives ONLY in Rat.java — SwarmAi delegates to it
+ *     instead of duplicating the logic and calling Deauther directly
+ */
 public class SwarmAi {
-    // SSID → Set of legitimate BSSIDs (first seen wins)
-    private final Map<String, Set<String>> legitimateAPs = new ConcurrentHashMap<>();
-    
-    // Last time we saw a specific BSSID (for cleanup)
-    private final Map<String, Long> lastSeen = new ConcurrentHashMap<>();
-    
+
+    // Minimum times we must see an SSID before trusting our "legitimate" pick
+    private static final int MIN_OBSERVATIONS = 3;
+
+    // SSID → (BSSID → observation count)
+    private final Map<String, Map<String, Integer>> apObservations = new ConcurrentHashMap<>();
+
+    // SSID → BSSID we currently consider legitimate (highest count)
+    private final Map<String, String> legitimateAPs = new ConcurrentHashMap<>();
+
+    // BSSIDs we already fired an alert for — avoids repeat storms
     private final Set<String> alreadyNuked = ConcurrentHashMap.newKeySet();
 
-    
+    // Last time we saw a BSSID — used for stale-entry cleanup
+    private final Map<String, Long> lastSeen = new ConcurrentHashMap<>();
+
     private final Rat rat;
     private final ScheduledExecutorService cleaner;
 
     public SwarmAi(Rat rat) {
-        this.rat = rat;
+        this.rat     = rat;
         this.cleaner = Executors.newSingleThreadScheduledExecutor();
-        
-        // Clean old entries every 5 minutes ( This should fix over clogging )
         cleaner.scheduleAtFixedRate(this::cleanupOldEntries, 5, 5, TimeUnit.MINUTES);
     }
 
     /**
-     * Will Called every time a new AP is discovered
+     * Called every time a beacon / probe-response is seen.
      */
     public void seeAP(String bssid, String ssid, int channel, String security) {
-        if (bssid == null || bssid.isEmpty() || ssid == null) return;
+        if (bssid == null || bssid.isEmpty() || ssid == null || ssid.isEmpty()) return;
+        if (ssid.equals("<hidden>")) return; // hidden SSIDs can't be evil-twin matched
 
         lastSeen.put(bssid, System.currentTimeMillis());
 
-        // Normalize SSID (trim + case-sensitive for now): NOTE!! Find more efficient method if possible 
         String cleanSsid = ssid.trim();
 
-        // First time we see this SSID → mark current BSSID as legitimate (Although this leaves a lot of room for error)
-        Set<String> knownGood = legitimateAPs.computeIfAbsent(cleanSsid, k -> new CopyOnWriteArraySet<>());
-        
-        if (knownGood.isEmpty()) {
-            knownGood.add(bssid);
-            rat.printlnAlert("LEGIT AP REGISTERED → " + cleanSsid + " = " + bssid);
-        } 
-        // We already know this SSID from another BSSID → EVIL TWIN!
-        else if (!knownGood.contains(bssid)) {
-            if (alreadyNuked.add(bssid)) {
-                rat.evilTwinDetected(cleanSsid, knownGood.iterator().next(), bssid, channel);
-            }
+        // Increment observation count for this BSSID under this SSID
+        Map<String, Integer> counts = apObservations.computeIfAbsent(cleanSsid, k -> new ConcurrentHashMap<>());
+        int newCount = counts.merge(bssid, 1, Integer::sum);
+
+        // Total observations across all BSSIDs for this SSID
+        int totalObs = counts.values().stream().mapToInt(Integer::intValue).sum();
+        if (totalObs < MIN_OBSERVATIONS) return; // not enough data yet
+
+        // Elect the BSSID with the highest count as legitimate
+        String topBssid = counts.entrySet().stream()
+                .max(Map.Entry.comparingByValue())
+                .map(Map.Entry::getKey)
+                .orElse(bssid);
+
+        String previousLegit = legitimateAPs.put(cleanSsid, topBssid);
+
+        // Log when we first lock in a legitimate AP
+        if (previousLegit == null) {
+            rat.printlnAlert("LEGIT AP CONFIRMED → \"" + cleanSsid + "\" = " + topBssid
+                    + " (" + counts.get(topBssid) + " obs)");
+        }
+
+        // Any OTHER BSSID broadcasting the same SSID with meaningful count → evil twin
+        for (Map.Entry<String, Integer> entry : counts.entrySet()) {
+            String candidateBssid = entry.getKey();
+            int    candidateCount = entry.getValue();
+
+            if (candidateBssid.equals(topBssid)) continue;         // this IS the legit one
+            if (candidateCount < 2) continue;                       // seen only once → noise
+            if (!alreadyNuked.add(candidateBssid)) continue;        // already alerted
+
+            // Delegate entirely to Rat — no direct Deauther call here
+            rat.evilTwinDetected(cleanSsid, topBssid, candidateBssid, channel);
         }
     }
 
     /**
-     * Called from Rat.java when evil twin is found 
+     * Remove entries for BSSIDs not seen in the last 30 minutes.
+     * Also clears them from alreadyNuked so a returning rogue gets re-flagged.
      */
-    public void evilTwinDetected(String ssid, String realBssid, String fakeBssid, int channel) {
-        rat.printlnStrongAlert("EVIL TWIN / ROGUE AP DETECTED");
-        rat.printlnStrongAlert("    SSID: " + ssid);
-        rat.printlnStrongAlert("    LEGITIMATE → " + realBssid);
-        rat.printlnStrongAlert("    FAKE / ROGUE → " + fakeBssid + " (channel " + channel + ")");
-        rat.printlnStrongAlert("    AUTO COUNTERMEASURE: DEAUTH FLOOD INITIATED");
-        rat.soundBell();
-
-        // AUTO-NUKE THE ROGUE AP — kill everyone connected to it 
-	Deauther d =rat.getDeauther();
-        if (d != null) {
-            new Thread(() -> {
-		
-		if(d!=null) {
-		    d.deauth("FF:FF:FF:FF:FF:FF", fakeBssid, 0); // broadcast client = everyone	
-		}
-            }).start();
-        }
-    }
-
     private void cleanupOldEntries() {
-        long cutoff = System.currentTimeMillis() - 30 * 60 * 1000; // 30 minutes??
-        lastSeen.entrySet().removeIf(e -> e.getValue() < cutoff);
+        long cutoff = System.currentTimeMillis() - 30 * 60 * 1000L;
+
+        Set<String> staleBssids = new HashSet<>();
+        lastSeen.entrySet().removeIf(e -> {
+            if (e.getValue() < cutoff) {
+                staleBssids.add(e.getKey());
+                return true;
+            }
+            return false;
+        });
+
+        // Remove stale BSSIDs from observation maps and alreadyNuked
+        for (Map<String, Integer> counts : apObservations.values()) {
+            staleBssids.forEach(counts::remove);
+        }
+        alreadyNuked.removeAll(staleBssids);
+
+        // Remove SSIDs that now have no remaining observations
+        apObservations.entrySet().removeIf(e -> e.getValue().isEmpty());
+        legitimateAPs.entrySet().removeIf(e -> !apObservations.containsKey(e.getKey()));
     }
 
     public void shutdown() {
