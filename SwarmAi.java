@@ -9,7 +9,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * caused false positives constantly (rogue seen first → real AP flagged).
  *
  * New approach:
- *   - Built a frequency map: SSID → (BSSID → seen count)
+ *   - Build a frequency map: SSID → (BSSID → seen count)
  *   - The BSSID with the HIGHEST observation count is "legitimate"
  *   - Only flag evil twins after MIN_OBSERVATIONS to avoid cold-start noise
  *   - Deduplicate alerts with alreadyNuked set (unchanged)
@@ -82,7 +82,7 @@ public class SwarmAi {
 
             if (candidateBssid.equals(topBssid)) continue;         // this IS the legit one
             if (candidateCount < 2) continue;                       // seen only once → noise
-            if (!alreadyNuked.add(candidateBssid)) continue;        // already alerted
+            if (!alreadyNuked.add(cleanSsid + "::" + candidateBssid)) continue; // already alerted
 
             // Delegate entirely to Rat — no direct Deauther call here
             rat.evilTwinDetected(cleanSsid, topBssid, candidateBssid, channel);
@@ -109,7 +109,11 @@ public class SwarmAi {
         for (Map<String, Integer> counts : apObservations.values()) {
             staleBssids.forEach(counts::remove);
         }
-        alreadyNuked.removeAll(staleBssids);
+        // alreadyNuked keys are "ssid::bssid" — remove any entry whose bssid suffix is stale
+        alreadyNuked.removeIf(key -> {
+            int sep = key.lastIndexOf("::");
+            return sep >= 0 && staleBssids.contains(key.substring(sep + 2));
+        });
 
         // Remove SSIDs that now have no remaining observations
         apObservations.entrySet().removeIf(e -> e.getValue().isEmpty());
