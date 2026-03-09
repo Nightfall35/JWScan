@@ -82,7 +82,7 @@ public class OuiDatabase {
         rat.println("Loaded " + ouiMap.size() + " built-in OUI entries");
     }
 
-    // ── Cache age check — FIX: was 10000, should be 1000L ───────────────────────
+    // -- Cache age check — FIX: was 10000, should be 1000L ----------------------------------------
     private boolean isCacheOlderThan(int days) {
         Path path = Paths.get(cacheFile);
         if (!Files.exists(path)) return true;

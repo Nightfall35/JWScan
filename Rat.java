@@ -2,7 +2,7 @@
  * THROUGH MY CEILING HENCE THE NAME... NOTHING SPECIAL TO IT)
  *
  *                                         AUTHOR      -> ISHMAEL D.TEMBO
- *                                         CREATED     -> JANUARY 3RD -> NOVEMBER 24
+ *                                         CREATED     -> JANUARY 3RD -> NOVEMBER 27
  *                                         ALIAS       -> NIGHTFALL35
  *                                         GITHUB      -> Nightfall35
  *                                         EMAIL       -> ishamelgoku@gmail.com
@@ -10,7 +10,7 @@
  *                                         DISCLAIMER: I AM NOT A NETWORK ENGINEER. JUST A JAVA-OBSESSED FOOL.
  *
  * BLACK ICE v2 — Pure-Java 802.11 surveillance lattice.
- * Born in Lusaka, Zambia — 2000.
+ * Born in Lusaka, Zambia — 2025.
  *
  * Legal note: For authorized security research, education, and testing on networks you own
  * or have explicit written permission to analyze. Active transmission features are disabled
@@ -460,7 +460,7 @@ public class Rat {
         public String  source         = "Unknown";
     }
 
-    /** Retained for any code that still references WebSocketHandshake. Though there should be none left. just to be safe*/
+    /** Retained for any code that still references WebSocketHandshake. */
     private static class WebSocketHandshake {
         static String accept(String key) {
             String magic = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -745,12 +745,24 @@ body{
 
 /* ── LEAFLET ── */
 .leaflet-popup-content-wrapper{
-  background:rgba(2,13,5,0.97)!important;border:1px solid var(--g)!important;
-  border-radius:2px!important;box-shadow:var(--glow)!important;
-  color:var(--g)!important;font-family:'JetBrains Mono',monospace!important;font-size:11px!important;
+  background:transparent!important;border:none!important;
+  border-radius:0!important;box-shadow:none!important;
+  padding:0!important;
 }
-.leaflet-popup-tip{background:var(--g)!important;}
-.leaflet-popup-close-button{color:var(--g)!important;font-size:16px!important;}
+.leaflet-popup-content{
+  margin:0!important;padding:0!important;
+  font-family:'JetBrains Mono',monospace!important;
+  font-size:11px!important;
+  width:auto!important;
+  min-width:280px!important;
+}
+.leaflet-popup-tip-container{display:none!important;}
+.leaflet-popup-close-button{
+  color:#0aff6e!important;font-size:18px!important;
+  top:6px!important;right:8px!important;
+  z-index:10;background:transparent!important;
+  text-shadow:0 0 6px #0aff6e!important;
+}
 .leaflet-control-attribution{display:none!important;}
 .leaflet-control-zoom a{
   background:rgba(2,13,5,0.95)!important;color:var(--g)!important;
@@ -1040,22 +1052,114 @@ function updateThreat(aps){
 // POPUP
 // ═══════════════════════════════════════════════════════════════
 function makePopup(ap){
-  const isOpen=ap.security&&(ap.security.includes('OPEN')||ap.security==='');
-  const col=isOpen?'#ff3c00':'#0aff6e';
-  const sc=ap.signal>-65?'var(--g)':ap.signal>-80?'var(--y)':'var(--r)';
-  return '<div style="min-width:210px;line-height:1.9;font-family:JetBrains Mono,monospace;">'+
-    '<div style="font-family:Bebas Neue,monospace;font-size:16px;letter-spacing:3px;color:'+col+
-    ';text-shadow:0 0 8px '+col+';margin-bottom:5px;border-bottom:1px solid '+col+'33;padding-bottom:3px;">'+
-    (ap.ssid||'&lt;HIDDEN&gt;')+'</div>'+
-    '<div style="color:#004d22;font-size:9px;margin-bottom:5px;">'+ap.bssid+'</div>'+
-    '<table style="font-size:10px;width:100%;border-collapse:collapse;">'+
-    '<tr><td style="color:#003d11;padding-right:12px;padding-bottom:2px;">SECURITY</td><td style="color:'+col+'">'+( ap.security||'OPEN')+'</td></tr>'+
-    '<tr><td style="color:#003d11;padding-bottom:2px;">SIGNAL</td><td>'+ap.signal+'dBm '+sigBars(ap.signal,sc)+'</td></tr>'+
-    '<tr><td style="color:#003d11;padding-bottom:2px;">CHANNEL</td><td>'+ap.channel+'</td></tr>'+
-    '<tr><td style="color:#003d11;padding-bottom:2px;">VENDOR</td><td style="color:#00aaff">'+( ap.vendor||'UNKNOWN')+'</td></tr>'+
-    '<tr><td style="color:#003d11;padding-bottom:2px;">SOURCE</td><td style="color:#004d11;font-size:9px">'+( ap.source||'?')+'</td></tr>'+
-    '<tr><td style="color:#003d11;">COORDS</td><td style="font-size:9px">'+ap.lat.toFixed(5)+', '+ap.lon.toFixed(5)+'</td></tr>'+
-    '</table></div>';
+  const isOpen  = ap.security && (ap.security.includes('OPEN') || ap.security === '');
+  const isWPA3  = ap.security && ap.security.includes('WPA3');
+  const isWPA2  = ap.security && ap.security.includes('WPA2') && !isWPA3;
+  const isHidden= !ap.ssid || ap.ssid === '<hidden>';
+
+  // Threat score 0-100
+  let threat = 0;
+  if (isOpen)          threat += 60;
+  if (isHidden)        threat += 15;
+  if (ap.signal > -55) threat += 15;
+  if (ap.channel === 0)threat += 10;
+  threat = Math.min(threat, 100);
+
+  const tCol  = threat >= 60 ? '#ff3c00' : threat >= 30 ? '#ffe600' : '#0aff6e';
+  const tLbl  = threat >= 60 ? 'HIGH'    : threat >= 30 ? 'MEDIUM'  : 'LOW';
+  const mCol  = isOpen ? '#ff3c00' : isWPA3 ? '#00e5ff' : '#0aff6e';
+  const sCol  = ap.signal > -55 ? '#0aff6e' : ap.signal > -70 ? '#ffe600' : '#ff3c00';
+  const sigPct= Math.max(0, Math.min(100, (ap.signal + 100) * 2));
+
+  const encBadge = isOpen
+    ? `<span style="background:#ff3c0022;color:#ff3c00;border:1px solid #ff3c00;padding:2px 8px;font-size:9px;letter-spacing:2px;font-family:JetBrains Mono,monospace;">&#9888; UNENCRYPTED</span>`
+    : isWPA3
+    ? `<span style="background:#00e5ff18;color:#00e5ff;border:1px solid #00e5ff55;padding:2px 8px;font-size:9px;letter-spacing:2px;font-family:JetBrains Mono,monospace;">&#9679; WPA3</span>`
+    : isWPA2
+    ? `<span style="background:#0aff6e18;color:#0aff6e;border:1px solid #0aff6e44;padding:2px 8px;font-size:9px;letter-spacing:2px;font-family:JetBrains Mono,monospace;">&#9679; WPA2</span>`
+    : `<span style="background:#ffe60018;color:#ffe600;border:1px solid #ffe60044;padding:2px 8px;font-size:9px;letter-spacing:2px;font-family:JetBrains Mono,monospace;">&#9888; LEGACY</span>`;
+
+  const band = ap.channel >= 36 ? '5 GHz' : ap.channel > 0 ? '2.4 GHz' : '---';
+  const freq = ap.channel >= 36
+    ? (5180 + (ap.channel - 36) * 5) + ' MHz'
+    : ap.channel > 0 ? (2412 + (ap.channel - 1) * 5) + ' MHz' : '---';
+  const sLbl = ap.signal > -55 ? 'EXCELLENT' : ap.signal > -65 ? 'GOOD' : ap.signal > -75 ? 'FAIR' : 'WEAK';
+
+  const ssidDisplay = isHidden ? '[ HIDDEN ]' : (ap.ssid || '---');
+  const lat6 = ap.lat ? ap.lat.toFixed(6) : '---';
+  const lon6 = ap.lon ? ap.lon.toFixed(6) : '---';
+
+  return `
+<div style="font-family:JetBrains Mono,monospace;background:#020d05;border:1px solid ${mCol}66;min-width:280px;overflow:hidden;">
+
+  <!-- HEADER -->
+  <div style="background:linear-gradient(135deg,${mCol}22,${mCol}08);border-bottom:1px solid ${mCol}44;padding:10px 12px 8px;">
+    <div style="font-family:'Bebas Neue',cursive,monospace;font-size:20px;letter-spacing:4px;color:${mCol};text-shadow:0 0 10px ${mCol};line-height:1.1;">
+      ${ssidDisplay}
+    </div>
+    <div style="color:#5aff9a;font-size:9px;letter-spacing:1px;margin-top:3px;font-family:JetBrains Mono,monospace;opacity:0.7;">
+      ${ap.bssid || '---'}
+    </div>
+    <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+      ${encBadge}
+    </div>
+  </div>
+
+  <!-- SIGNAL BAR -->
+  <div style="padding:8px 12px 7px;border-bottom:1px solid #0aff6e22;">
+    <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+      <span style="font-size:9px;color:#4dcc77;letter-spacing:2px;">SIGNAL STRENGTH</span>
+      <span style="font-size:10px;color:${sCol};font-family:'Bebas Neue',monospace;letter-spacing:1px;">${ap.signal} dBm &nbsp; ${sLbl}</span>
+    </div>
+    <div style="height:5px;background:#071a0e;border:1px solid #0aff6e33;border-radius:2px;overflow:hidden;">
+      <div style="height:100%;width:${sigPct}%;background:linear-gradient(90deg,${sCol}88,${sCol});box-shadow:0 0 5px ${sCol};"></div>
+    </div>
+  </div>
+
+  <!-- THREAT BAR -->
+  <div style="padding:7px 12px;border-bottom:1px solid ${tCol}33;background:${tCol}12;">
+    <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+      <span style="font-size:9px;color:#4dcc77;letter-spacing:2px;">THREAT SCORE</span>
+      <span style="font-family:'Bebas Neue',monospace;font-size:13px;color:${tCol};text-shadow:0 0 8px ${tCol};letter-spacing:3px;">${tLbl} &nbsp; ${threat}/100</span>
+    </div>
+    <div style="height:4px;background:#071a0e;border:1px solid ${tCol}33;border-radius:2px;overflow:hidden;">
+      <div style="height:100%;width:${threat}%;background:linear-gradient(90deg,${tCol}88,${tCol});box-shadow:0 0 4px ${tCol};"></div>
+    </div>
+  </div>
+
+  <!-- DATA TABLE -->
+  <div style="padding:8px 12px 10px;">
+    <table style="width:100%;border-collapse:collapse;font-size:10px;">
+      <tr>
+        <td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Vendor</td>
+        <td style="color:#00ccff;padding:3px 0;font-weight:bold;">${ap.vendor || 'UNKNOWN'}</td>
+      </tr>
+      <tr>
+        <td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Channel</td>
+        <td style="color:#0aff6e;padding:3px 0;">${ap.channel > 0 ? ap.channel : '?'} <span style="color:#5aaa77;font-size:9px;">${band} // ${freq}</span></td>
+      </tr>
+      <tr>
+        <td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Encryption</td>
+        <td style="color:${mCol};padding:3px 0;font-weight:bold;">${ap.security || 'NONE'}</td>
+      </tr>
+      <tr>
+        <td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Geo Source</td>
+        <td style="color:#7acc99;padding:3px 0;font-size:9px;">${ap.source || '---'}</td>
+      </tr>
+      <tr>
+        <td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Coords</td>
+        <td style="color:#5aaa77;padding:3px 0;font-size:9px;">${lat6}, ${lon6}</td>
+      </tr>
+    </table>
+  </div>
+
+  <!-- FOOTER -->
+  <div style="border-top:1px solid #0aff6e22;padding:5px 12px;display:flex;justify-content:space-between;background:#0aff6e0a;">
+    <span style="font-size:8px;color:#3d7a50;letter-spacing:3px;">BLACK ICE v2</span>
+    <span style="font-size:8px;color:${mCol}aa;letter-spacing:1px;">NIGHTFALL35</span>
+  </div>
+
+</div>`;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1082,7 +1186,7 @@ function updateDisplay(aps){
       const m=L.circleMarker([ap.lat,ap.lon],{
         radius:r,color:col,fillColor:col,fillOpacity:0.8,weight:1.5
       }).addTo(map);
-      m.bindPopup(makePopup(ap));
+      m.bindPopup(makePopup(ap), {maxWidth: 320, minWidth: 280});
       markers[key]=m;
 
       if(isOpen){

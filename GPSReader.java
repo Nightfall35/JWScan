@@ -81,8 +81,11 @@ public class GPSReader extends Thread implements Closeable {
     }
 
     private double convertToDecimalDegrees(double raw, String direction) {
-        double degrees = Math.floor(raw / 100.0);
-        double minutes = raw % 100.0;
+        // NMEA raw values are always positive (direction encoded in S/N/E/W letter)
+        // Using Math.abs() protects against malformed sentences with leading minus
+        double absRaw = Math.abs(raw);
+        double degrees = Math.floor(absRaw / 100.0);
+        double minutes = absRaw % 100.0;
         double decimal = degrees + minutes / 60.0;
         if ("S".equalsIgnoreCase(direction) || "W".equalsIgnoreCase(direction))
             return -decimal;
