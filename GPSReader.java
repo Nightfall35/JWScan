@@ -1,129 +1,101 @@
-import java.io.BufferedReader;
-import java.io.Closeable;
-import java.io.FileInputStream;
-import java.io.InputStreamReader;
+import java.io.*;
+import java.nio.file.*;
+
 /*
-*Created by Ishmael D. Tembo - Lusaka , zamabia 
-*Supports Windows (COM3, COM4..) and Linus/Raspberry pi(Probably - not yet tested)
-*/
+ * GPSReader — reads NMEA sentences from a serial GPS device.
+ * Supports Windows (COM3, COM4...) and Linux/Raspberry Pi (/dev/ttyUSB0, /dev/ttyACM0).
+ *
+ * To configure the port, create gps_port.txt in the project folder with one line:
+ *   COM4          (Windows)
+ *   /dev/ttyUSB0  (Linux)
+ *
+ * Author: Ishmael D. Tembo — Lusaka, Zambia
+ */
 public class GPSReader extends Thread implements Closeable {
-    private volatile double lat = 0.0;
-    private volatile double lon = 0.0;
-    private volatile boolean hasFix = false;
+
+    private volatile double  lat     = 0.0;
+    private volatile double  lon     = 0.0;
+    private volatile boolean hasFix  = false;
     private volatile boolean running = true;
 
     private final String portName;
 
     public GPSReader(String portName) {
-        this.portName =portName;
-        this.setName ("GPS -READER-THREAD");
-        this.setDaemon(true); // this should block jvmm shutdown 
-        this.start();
+        this.portName = portName;
+        setName("GPS-READER");
+        setDaemon(true); // don't block JVM shutdown
+        start();
     }
 
-    @Override 
+    @Override
     public void run() {
-        try(BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(portName)))) {
-            System.out.println(" NOTE !!!!: \nIF you see this in the lgs :\n[GPS] Error reading the port (unplugged? / no GPS?): \'dev\ttyUSB0 (The system cannot find the path specified)\nIt is caused by windows");
-            System.out.println("[GPS] Listening on " + portName + " -waiting for validated fix ....");
+        System.out.println("[GPS] Opening port: " + portName);
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(new FileInputStream(portName)))) {
 
-            while(running) {
+            System.out.println("[GPS] Port open — waiting for NMEA fix...");
+            while (running) {
                 String line = reader.readLine();
-                if(line == null) continue;
-                if(line.startsWith("$GPGGA") || line.startsWith("@GNGGA")) {
+                if (line == null) continue;
+                // FIX: was '@GNGGA' — should be '$GNGGA' for multi-constellation GPS
+                if (line.startsWith("$GPGGA") || line.startsWith("$GNGGA")) {
                     parseGGA(line);
                 }
-                // #gprmc WILL BE ADDED LATER 
+                // GPRMC / GNRMC give speed + heading — add later
             }
-        }catch(Exception e) {
-            if(running)
-                System.out.println("[GPS] Error reading the port (unplugged? / no GPS?): " + e.getMessage());
-
-            
+        } catch (Exception e) {
+            if (running)
+                System.out.println("[GPS] Port error (" + portName + "): " + e.getMessage());
         }
         System.out.println("[GPS] Reader thread stopped.");
     }
-    
-    public void parseGGA(String sentence){
-        String[] parts = sentence.split(",");
 
-        if("0".equals(parts[6])) {
-            if(hasFix) {
-                System.out.println("[GPS] Lost fix.");
-                hasFix = false;
-            }
-            return;
-        }
-        if(parts[2].isEmpty() || parts[4].isEmpty()) return;
-
+    public void parseGGA(String sentence) {
         try {
-            double latRaw = Double.parseDouble(parts[2]);
-            double lonRaw = Double.parseDouble(parts[4]);
+            String[] parts = sentence.split(",");
+            if (parts.length < 7) return;
 
-            double newLat = convertToDecimalDegrees(latRaw, parts[3]);
-            double newLon = convertToDecimalDegrees(lonRaw, parts[5]);
+            // parts[6] = fix quality: 0 = no fix
+            if ("0".equals(parts[6]) || parts[6].isEmpty()) {
+                if (hasFix) {
+                    System.out.println("[GPS] Fix lost.");
+                    hasFix = false;
+                }
+                return;
+            }
 
-            this.lat = newLat;
-            this.lon = newLon;
+            if (parts[2].isEmpty() || parts[4].isEmpty()) return;
+
+            double newLat = convertToDecimalDegrees(Double.parseDouble(parts[2]), parts[3]);
+            double newLon = convertToDecimalDegrees(Double.parseDouble(parts[4]), parts[5]);
+
+            this.lat    = newLat;
+            this.lon    = newLon;
             this.hasFix = true;
 
-            System.out.printf("[GPS] FIX -> %.6f, %.6f, %.6f%n",lat , lon);
+            System.out.printf("[GPS] FIX -> %.6f, %.6f%n", lat, lon);
 
-        }catch(NumberFormatException ignore) {}
+        } catch (NumberFormatException ignored) {
+            // Malformed sentence — skip silently
+        }
     }
 
-    private double convertToDecimalDegrees(double raw , String direction ) {
-        double degrees = Math.floor(raw / 100);
-        double minutes = raw % 100;
-        double decimal = degrees + minutes /60.0;
-
-        if("S".equalsIgnoreCase(direction) || "W".equalsIgnoreCase(direction)) {
+    private double convertToDecimalDegrees(double raw, String direction) {
+        double degrees = Math.floor(raw / 100.0);
+        double minutes = raw % 100.0;
+        double decimal = degrees + minutes / 60.0;
+        if ("S".equalsIgnoreCase(direction) || "W".equalsIgnoreCase(direction))
             return -decimal;
-        }
         return decimal;
     }
 
-    public double getLat() { return lat; }
-    public double getLon() { return lon; }
-    public boolean hasFix() { return hasFix; }
+    public double  getLat()   { return lat;    }
+    public double  getLon()   { return lon;    }
+    public boolean hasFix()   { return hasFix; }
 
-    @Override 
+    @Override
     public void close() {
         running = false;
-        this.interrupt();
-    } 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        interrupt();
+    }
 }
