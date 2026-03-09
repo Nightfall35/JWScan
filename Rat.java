@@ -2,7 +2,7 @@
  * THROUGH MY CEILING HENCE THE NAME... NOTHING SPECIAL TO IT)
  *
  *                                         AUTHOR      -> ISHMAEL D.TEMBO
- *                                         CREATED     -> JANUARY 3RD -> NOVEMBER 27
+ *                                         CREATED     -> JANUARY 3RD -> NOVEMBER 24
  *                                         ALIAS       -> NIGHTFALL35
  *                                         GITHUB      -> Nightfall35
  *                                         EMAIL       -> ishamelgoku@gmail.com
@@ -10,7 +10,7 @@
  *                                         DISCLAIMER: I AM NOT A NETWORK ENGINEER. JUST A JAVA-OBSESSED FOOL.
  *
  * BLACK ICE v2 — Pure-Java 802.11 surveillance lattice.
- * Born in Lusaka, Zambia — 2025.
+ * Born in Lusaka, Zambia — 2000.
  *
  * Legal note: For authorized security research, education, and testing on networks you own
  * or have explicit written permission to analyze. Active transmission features are disabled
