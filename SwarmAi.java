@@ -9,7 +9,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * caused false positives constantly (rogue seen first → real AP flagged).
  *
  * New approach:
- *   - Build a frequency map: SSID → (BSSID → seen count)
+ *   - Built a frequency map: SSID → (BSSID → seen count)
  *   - The BSSID with the HIGHEST observation count is "legitimate"
  *   - Only flag evil twins after MIN_OBSERVATIONS to avoid cold-start noise
  *   - Deduplicate alerts with alreadyNuked set (unchanged)
