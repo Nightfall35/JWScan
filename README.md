@@ -18,7 +18,7 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-blue?style=flat-square)]()
 [![Status](https://img.shields.io/badge/Status-Active-brightgreen?style=flat-square)]()
 
-*Born in Lusaka, Zambia — 2025*
+*Born in Lusaka, Zambia — 2024*
 
 </div>
 
