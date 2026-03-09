@@ -460,7 +460,7 @@ public class Rat {
         public String  source         = "Unknown";
     }
 
-    /** Retained for any code that still references WebSocketHandshake. */
+    /** Retained for any code that still references WebSocketHandshake. Though there should be none left. just to be safe*/
     private static class WebSocketHandshake {
         static String accept(String key) {
             String magic = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
