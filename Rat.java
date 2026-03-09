@@ -65,13 +65,23 @@ public class Rat {
         background.submit(this::downloadAndCacheIeeeOui);
         ai = new SwarmAi(this);
 
-        // GPS reader — tries COM3,COM4,COM5,/dev/ttyUSB0 in order
-        for (String gpsPort : new String[]{"COM3","COM4","COM5","COM6","/dev/ttyUSB0","/dev/ttyACM0"}) {
-            try {
-                gpsReader = new GPSReader(gpsPort);
-                println("[GPS] Attempting GPS on " + gpsPort);
-                break;
-            } catch (Exception ignored) {}
+        // GPS reader — reads port from gps_port.txt or defaults to COM3/ttyUSB0
+        // GPSReader opens the port asynchronously; hasFix() returns false until a valid NMEA fix arrives.
+        String gpsPortToTry = "COM3"; // Windows default
+        try {
+            java.nio.file.Path gpsConf = java.nio.file.Paths.get("gps_port.txt");
+            if (java.nio.file.Files.exists(gpsConf)) {
+                String line = java.nio.file.Files.readAllLines(gpsConf).stream()
+                    .filter(l -> !l.trim().isEmpty() && !l.startsWith("#"))
+                    .findFirst().orElse("COM3").trim();
+                gpsPortToTry = line;
+            }
+        } catch (Exception ignored) {}
+        try {
+            gpsReader = new GPSReader(gpsPortToTry);
+            println("[GPS] Reader started on " + gpsPortToTry + " (hasFix=false until NMEA lock)");
+        } catch (Exception e) {
+            println("[GPS] Could not start GPS reader on " + gpsPortToTry + ": " + e.getMessage());
         }
 
         // Auto counter-deauth when someone attacks us
@@ -236,11 +246,7 @@ public class Rat {
             existing.security = ap.security;
             existing.channel  = ap.channel;
             existing.signal   = Math.max(existing.signal, ap.signal);
-            // only overwrite lat/lon if we don't yet have a real fix
-            if (existing.positionRandom) {
-                existing.lat = ap.lat;
-                existing.lon = ap.lon;
-            }
+            // lat/lon managed exclusively by buildFullJson via geoExecutor — never overwrite here
             existing.lastSeen = ap.lastSeen;
         }
         ai.seeAP(ap.bssid, ap.ssid, ap.channel, ap.security);
