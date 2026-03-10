@@ -82,7 +82,7 @@ public class OuiDatabase {
         rat.println("Loaded " + ouiMap.size() + " built-in OUI entries");
     }
 
-    // -- Cache age check — FIX: was 10000, should be 1000L ----------------------------------------
+    // ── Cache age check — FIX: was 10000, should be 1000L ───────────────────────
     private boolean isCacheOlderThan(int days) {
         Path path = Paths.get(cacheFile);
         if (!Files.exists(path)) return true;
@@ -109,12 +109,37 @@ public class OuiDatabase {
     }
 
     private boolean downloadFromIeee() {
+        // Try multiple mirrors — IEEE blocks Java default User-Agent
+        String[] urls = {
+            "https://standards-oui.ieee.org/oui/oui.txt",
+            "https://gitlab.com/wireshark/wireshark/-/raw/master/manuf",
+            "https://raw.githubusercontent.com/wireshark/wireshark/master/manuf"
+        };
+        for (String tryUrl : urls) {
+            try {
+                rat.println("[OUI] Trying: " + tryUrl);
+                if (tryDownloadIeee(tryUrl)) return true;
+            } catch (Exception e) {
+                rat.println("[OUI] Failed " + tryUrl + ": " + e.getMessage());
+            }
+        }
+        return false;
+    }
+
+    private boolean tryDownloadIeee(String urlStr) {
         try {
-            HttpURLConnection conn = (HttpURLConnection) new URL(IEEE_OUI_URL).openConnection();
+            HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
             conn.setRequestMethod("GET");
-            conn.setConnectTimeout(10_000);
-            conn.setReadTimeout(30_000);
-            if (conn.getResponseCode() != 200) return false;
+            conn.setConnectTimeout(15_000);
+            conn.setReadTimeout(60_000);
+            // IEEE blocks default Java agent — spoof a browser agent
+            conn.setRequestProperty("User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0");
+            conn.setRequestProperty("Accept", "text/plain,*/*");
+            if (conn.getResponseCode() != 200) {
+                rat.println("[OUI] HTTP " + conn.getResponseCode() + " from " + urlStr);
+                return false;
+            }
 
             int count = 0;
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
@@ -135,38 +160,52 @@ public class OuiDatabase {
                         rat.println("OUI: processed " + count + " entries...");
                 }
             }
-            rat.println("OUI total: " + count + " entries");
-            return count > 10_000;
+            rat.println("[OUI] Total entries loaded: " + count);
+            return count > 5_000;
         } catch (Exception e) {
-            rat.println("IEEE OUI download failed: " + e.getMessage());
+            rat.println("[OUI] Parse error: " + e.getMessage());
             return false;
         }
     }
 
     private boolean downloadFromWireshark() {
+        // Wireshark manuf file: lines like "00:00:0C	Cisco	Cisco Systems, Inc"
+        // or OUI/28 for 28-bit blocks — we only want 6-char (24-bit OUI) entries
+        String urlStr = WIRESHARK_OUI_URL;
         try {
-            HttpURLConnection conn = (HttpURLConnection) new URL(WIRESHARK_OUI_URL).openConnection();
+            HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
             conn.setRequestMethod("GET");
+            conn.setConnectTimeout(15_000);
+            conn.setReadTimeout(60_000);
+            conn.setRequestProperty("User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0");
             if (conn.getResponseCode() != 200) return false;
 
             int count = 0;
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(conn.getInputStream()))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
                     if (line.startsWith("#") || line.trim().isEmpty()) continue;
+                    // Skip 28-bit and 36-bit blocks (contain "/" in MAC)
+                    if (line.contains("/")) continue;
                     String[] parts = line.split("\t");
                     if (parts.length >= 2) {
-                        String mac    = parts[0].replace(":", "").toUpperCase();
-                        String vendor = parts[1].trim();
-                        if (mac.contains("/")) mac = mac.split("/")[0];
-                        if (mac.length() == 6) { ouiMap.put(mac, vendor); count++; }
+                        // MAC is like "00:00:0C" — strip colons
+                        String mac = parts[0].trim().replace(":", "").toUpperCase();
+                        // Use long name (parts[2]) if available, else short (parts[1])
+                        String vendor = parts.length >= 3 ? parts[2].trim() : parts[1].trim();
+                        if (mac.length() == 6) {
+                            ouiMap.put(mac, vendor);
+                            count++;
+                        }
                     }
                 }
             }
-            rat.println("Wireshark OUI entries: " + count);
-            return count > 10_000;
+            rat.println("[OUI] Wireshark entries: " + count);
+            return count > 5_000;
         } catch (Exception e) {
-            rat.println("Wireshark OUI download failed: " + e.getMessage());
+            rat.println("[OUI] Wireshark download failed: " + e.getMessage());
             return false;
         }
     }
@@ -193,7 +232,7 @@ public class OuiDatabase {
         } catch (Exception e) {
             rat.println("OUI lookup error for " + bssid + ": " + e.getMessage());
         }
-        return "Unknown";
+        return null;
     }
 
     public String getDetailedInfo(String bssid) {
