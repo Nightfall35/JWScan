@@ -1,0 +1,19 @@
+﻿git # ── Secrets (NEVER commit these) ──
+Wigle_config.txt
+gps_port.txt
+
+# ── Cache files ──
+wigle_cache.dat
+oui_cache.dat
+
+# ── Java compiled output ──
+*.class
+
+# ── IDE folders ──
+.idea/
+*.iml
+.vscode/
+
+# ── OS junk ──
+Thumbs.db
+.DS_Store
