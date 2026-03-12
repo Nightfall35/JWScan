@@ -2073,6 +2073,6 @@ const bootLines=[
   setTimeout(()=>{document.getElementById('boot-overlay').style.display='none';},800);
 })();
 </script>
-</body></html>
+</body></htmla
 """;
 }
