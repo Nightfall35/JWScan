@@ -734,7 +734,7 @@ body{
 #map{
   position:fixed;inset:0;
   z-index:0;
-  filter:saturate(0.15) brightness(0.55) contrast(1.5);
+  filter:hue-rotate(105deg) saturate(0.25) brightness(0.4) contrast(1.4);
   transition:opacity 0.5s;
 }
 #map.hidden{ opacity:0; pointer-events:none; }
@@ -1256,10 +1256,10 @@ setInterval(updateClock,1000); updateClock();
 // MAP  —  CartoDB Dark Matter tiles
 // ═══════════════════════════════════════════════════════════════
 const map = L.map('map',{zoomControl:true,attributionControl:false}).setView([-15.3875,28.3228],15);
-L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{
-  maxZoom:19,
-  subdomains:'abcd'
-}).addTo(map);
+const cartoTiles = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+  maxZoom:19
+});
+cartoTiles.addTo(map);
 
 const markers={}, pulseRings={};
 let allAps={}, panelOpen=false, reconnects=0;
