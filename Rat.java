@@ -21,10 +21,12 @@ import com.sun.net.httpserver.*;
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
 import java.time.*;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 import org.pcap4j.core.PcapNetworkInterface;
 
 public class Rat {
@@ -55,6 +57,13 @@ public class Rat {
     private volatile boolean gpsActive   = false;
     private GPSReader gpsReader = null;
 
+    // ── Survey / wardriving state ────────────────────────────────────────────────
+    private volatile boolean         surveyActive     = false;
+    private final    AtomicLong      surveyReadings   = new AtomicLong(0);
+    private final    Path            surveyFile       = Paths.get("survey_log.csv");
+    private          PrintWriter     surveyWriter     = null;
+    private final    Object          surveyLock       = new Object();
+
     // ── Constructor ─────────────────────────────────────────────────────────────
     public Rat(int port) {
         this.httpPort    = port;
@@ -65,9 +74,7 @@ public class Rat {
         background.submit(this::downloadAndCacheIeeeOui);
         ai = new SwarmAi(this);
 
-        // GPS reader — reads port from gps_port.txt or defaults to COM3/ttyUSB0
-        // GPSReader opens the port asynchronously; hasFix() returns false until a valid NMEA fix arrives.
-        String gpsPortToTry = "COM3"; // Windows default
+        String gpsPortToTry = "COM3";
         try {
             java.nio.file.Path gpsConf = java.nio.file.Paths.get("gps_port.txt");
             if (java.nio.file.Files.exists(gpsConf)) {
@@ -84,12 +91,11 @@ public class Rat {
             println("[GPS] Could not start GPS reader on " + gpsPortToTry + ": " + e.getMessage());
         }
 
-        // Auto counter-deauth when someone attacks us
         onDeauthAttack = (src, dst, count) -> {
             if (dst.equalsIgnoreCase(myMac) || dst.equalsIgnoreCase("FF:FF:FF:FF:FF:FF")) {
                 printlnStrongAlert("ATTACK DETECTED → " + src + " deauthing YOU → COUNTER-ATTACK ENGAGED");
                 if (deauther != null && counterMode) {
-                    deauther.deauth(src, src, 0); // infinite revenge
+                    deauther.deauth(src, src, 0);
                 }
             }
         };
@@ -124,7 +130,6 @@ public class Rat {
 
     // ── SSE broadcast ───────────────────────────────────────────────────────────
     private void broadcastFullUpdate() {
-        // Update operator position from GPS if available
         if (gpsReader != null && gpsReader.hasFix()) {
             operatorLat = gpsReader.getLat();
             operatorLon = gpsReader.getLon();
@@ -134,6 +139,7 @@ public class Rat {
             }
         }
         if (sseClients.isEmpty()) return;
+        writeSurveyReadings();
         String json = buildFullJson();
         String msg  = "data: " + json + "\n\n";
 
@@ -161,7 +167,7 @@ public class Rat {
 
     // ── JSON builder ────────────────────────────────────────────────────────────
     public String buildFullJson() {
-        StringBuilder sb  = new StringBuilder("{\"type\":\"full\",\"operator\":{\"lat\":" + operatorLat + ",\"lon\":" + operatorLon + ",\"gps\":" + gpsActive + "},\"aps\":{");
+        StringBuilder sb  = new StringBuilder("{\"type\":\"full\",\"operator\":{\"lat\":" + operatorLat + ",\"lon\":" + operatorLon + ",\"gps\":" + gpsActive + "},\"survey\":{\"active\":" + surveyActive + ",\"readings\":" + surveyReadings.get() + "},\"aps\":{");
         boolean       first = true;
         long          now   = System.currentTimeMillis();
 
@@ -175,11 +181,9 @@ public class Rat {
             if (vendor == null) vendor = getVendorFromBssid(ap.bssid);
             if (vendor == null) vendor = "unknown";
 
-            // positionRandom = false → needs geolocation; true → real fix already acquired
             if (!ap.positionRandom) {
                 long now2 = System.currentTimeMillis();
                 Long lastAttempt = geoLastAttempt.get(ap.bssid);
-                // Retry at most once per 30 seconds per AP to avoid Wigle rate-limit hammering
                 if (lastAttempt == null || now2 - lastAttempt > 30_000) {
                     geoLastAttempt.put(ap.bssid, now2);
                     final AP apRef = ap;
@@ -192,7 +196,6 @@ public class Rat {
                             apRef.positionRandom = true;
                             println("[GEO] WIGLE FIX → " + apRef.ssid + " @ " + geo.lat + "," + geo.lon);
                         } else {
-                            // Temporary placeholder — stays false so next cycle retries
                             WigleGeolocator.GeoResult approx = geolocator.getApproximateLocation();
                             if (approx.success) {
                                 double offset = 0.03 * (Math.random() - 0.5);
@@ -230,7 +233,7 @@ public class Rat {
         String id       = !ap.bssid.isEmpty() ? ap.bssid : ap.ssid;
         AP     existing = seenById.get(id);
 
-        ap.positionRandom = false; // let buildFullJson attempt Wigle geolocation first
+        ap.positionRandom = false;
         ap.lastSeen       = System.currentTimeMillis();
 
         if (existing == null) {
@@ -246,7 +249,6 @@ public class Rat {
             existing.security = ap.security;
             existing.channel  = ap.channel;
             existing.signal   = Math.max(existing.signal, ap.signal);
-            // lat/lon managed exclusively by buildFullJson via geoExecutor — never overwrite here
             existing.lastSeen = ap.lastSeen;
         }
         ai.seeAP(ap.bssid, ap.ssid, ap.channel, ap.security);
@@ -266,7 +268,7 @@ public class Rat {
     interface DeauthCallback { void accept(String src, String dst, int count); }
     private DeauthCallback onDeauthAttack;
 
-    // ── Evil twin callback (called by SwarmAi) ──────────────────────────────────
+    // ── Evil twin callback ───────────────────────────────────────────────────────
     public void evilTwinDetected(String ssid, String realBssid, String fakeBssid, int channel) {
         printlnStrongAlert("EVIL TWIN / ROGUE AP DETECTED");
         printlnStrongAlert("    SSID:        " + ssid);
@@ -284,7 +286,6 @@ public class Rat {
         try {
             httpServer = HttpServer.create(new InetSocketAddress(httpPort), 0);
 
-            // ── Dashboard ──
             httpServer.createContext("/", exchange -> {
                 String path = exchange.getRequestURI().getPath();
                 println("HTTP " + exchange.getRequestMethod() + " " + path);
@@ -307,7 +308,82 @@ public class Rat {
                 exchange.close();
             });
 
-            // ── SSE endpoint ──
+            // ── Survey control ──
+            httpServer.createContext("/survey", exchange -> {
+                String method = exchange.getRequestMethod();
+                String path   = exchange.getRequestURI().getPath();
+                exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+
+                if (path.equals("/survey/export") && "GET".equals(method)) {
+                    // Download the CSV file
+                    if (!Files.exists(surveyFile)) {
+                        byte[] msg = "No survey data yet.".getBytes(StandardCharsets.UTF_8);
+                        exchange.sendResponseHeaders(404, msg.length);
+                        exchange.getResponseBody().write(msg);
+                    } else {
+                        byte[] csv = Files.readAllBytes(surveyFile);
+                        exchange.getResponseHeaders().set("Content-Type", "text/csv");
+                        exchange.getResponseHeaders().set("Content-Disposition",
+                            "attachment; filename=\"survey_" + LocalDate.now() + ".csv\"");
+                        exchange.sendResponseHeaders(200, csv.length);
+                        exchange.getResponseBody().write(csv);
+                    }
+                    exchange.getResponseBody().close();
+                    exchange.close();
+                    return;
+                }
+
+                if ("POST".equals(method)) {
+                    String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8).trim();
+                    String resp;
+                    if ("start".equals(body)) {
+                        startSurvey();
+                        resp = "{\"status\":\"started\",\"readings\":" + surveyReadings.get() + "}";
+                    } else if ("stop".equals(body)) {
+                        stopSurvey();
+                        resp = "{\"status\":\"stopped\",\"readings\":" + surveyReadings.get() + "}";
+                    } else if ("clear".equals(body)) {
+                        stopSurvey();
+                        surveyReadings.set(0);
+                        try { Files.deleteIfExists(surveyFile); } catch (IOException ignored) {}
+                        resp = "{\"status\":\"cleared\"}";
+                    } else {
+                        resp = "{\"error\":\"unknown command\"}";
+                    }
+                    byte[] rb = resp.getBytes(StandardCharsets.UTF_8);
+                    exchange.getResponseHeaders().set("Content-Type", "application/json");
+                    exchange.sendResponseHeaders(200, rb.length);
+                    exchange.getResponseBody().write(rb);
+                    exchange.getResponseBody().close();
+                    exchange.close();
+                    return;
+                }
+
+                exchange.sendResponseHeaders(405, -1);
+                exchange.close();
+            });
+
+            httpServer.createContext("/survey/export", exchange -> {
+                exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+                if (!"GET".equals(exchange.getRequestMethod())) {
+                    exchange.sendResponseHeaders(405, -1); exchange.close(); return;
+                }
+                if (!Files.exists(surveyFile)) {
+                    byte[] msg = "No survey data yet.".getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(404, msg.length);
+                    exchange.getResponseBody().write(msg);
+                } else {
+                    byte[] csv = Files.readAllBytes(surveyFile);
+                    exchange.getResponseHeaders().set("Content-Type", "text/csv");
+                    exchange.getResponseHeaders().set("Content-Disposition",
+                        "attachment; filename=\"survey_" + LocalDate.now() + ".csv\"");
+                    exchange.sendResponseHeaders(200, csv.length);
+                    exchange.getResponseBody().write(csv);
+                }
+                exchange.getResponseBody().close();
+                exchange.close();
+            });
+
             httpServer.createContext("/sse", exchange -> {
                 println("New SSE connection from " + exchange.getRemoteAddress());
                 if (!"GET".equals(exchange.getRequestMethod())) {
@@ -330,7 +406,6 @@ public class Rat {
                     sseClients.add(exchange);
                     println("SSE client registered (" + sseClients.size() + " total)");
 
-                    // Keep thread alive with heartbeats; actual data pushed by scheduler
                     while (!Thread.currentThread().isInterrupted()) {
                         try {
                             Thread.sleep(15_000);
@@ -361,11 +436,67 @@ public class Rat {
     private void shutdown() {
         println("\nShutting down BLACK ICE...");
         if (passiveScanner != null) passiveScanner.stop();
+        stopSurvey();
         scheduler.shutdownNow();
         background.shutdownNow();
         geoExecutor.shutdownNow();
         if (httpServer != null) httpServer.stop(1);
         println("Swarm offline.");
+    }
+
+    // ── Survey / wardriving ──────────────────────────────────────────────────────
+    public void startSurvey() {
+        synchronized (surveyLock) {
+            if (surveyActive) return;
+            try {
+                boolean newFile = !Files.exists(surveyFile);
+                surveyWriter = new PrintWriter(new FileWriter(surveyFile.toFile(), true));
+                if (newFile) surveyWriter.println("timestamp,bssid,ssid,rssi,lat,lon,channel,security");
+                surveyActive = true;
+                println("[SURVEY] Walk-survey STARTED → " + surveyFile.toAbsolutePath());
+            } catch (IOException e) {
+                printlnStrongAlert("[SURVEY] Failed to open log file: " + e.getMessage());
+            }
+        }
+    }
+
+    public void stopSurvey() {
+        synchronized (surveyLock) {
+            if (!surveyActive) return;
+            surveyActive = false;
+            if (surveyWriter != null) { surveyWriter.flush(); surveyWriter.close(); surveyWriter = null; }
+            println("[SURVEY] Walk-survey STOPPED — " + surveyReadings.get() + " readings written");
+        }
+    }
+
+    /** Called every SSE tick when survey is active and GPS has a fix. */
+    private void writeSurveyReadings() {
+        if (!surveyActive || surveyWriter == null) return;
+        if (!gpsActive && (gpsReader == null || !gpsReader.hasFix())) return;
+        double lat = operatorLat, lon = operatorLon;
+        String ts  = LocalDateTime.now().format(dtf);
+        synchronized (surveyLock) {
+            for (AP ap : seenById.values()) {
+                if (System.currentTimeMillis() - ap.lastSeen > 5_000) continue;
+                surveyWriter.printf("%s,%s,%s,%d,%.8f,%.8f,%d,%s%n",
+                    ts,
+                    csvEscape(ap.bssid),
+                    csvEscape(ap.ssid),
+                    ap.signal,
+                    lat, lon,
+                    ap.channel,
+                    csvEscape(ap.security));
+                surveyReadings.incrementAndGet();
+            }
+            surveyWriter.flush();
+        }
+    }
+
+    private String csvEscape(String s) {
+        if (s == null) return "";
+        if (s.contains(",") || s.contains("\"") || s.contains("\n"))
+            return "\"" + s.replace("\"", "\"\"") + "\"";
+        return s;
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -411,8 +542,6 @@ public class Rat {
     public void soundBell()                 { System.out.print("\007"); System.out.flush(); }
 
     // ── OUI / vendor lookup ─────────────────────────────────────────────────────
-    // Seed ouiMap with common prefixes so lookups work instantly before
-    // OuiDatabase finishes its background IEEE download.
     private void loadBuiltInOuIs() {
         String[][] entries = {
             {"001122","Cisco"},       {"44650D","Cisco Meraki"}, {"A4C3F0","Apple"},
@@ -461,14 +590,7 @@ public class Rat {
         println("[OUI] " + ouiMap.size() + " built-in entries loaded");
     }
 
-    /**
-     * Delegates to OuiDatabase which handles the full IEEE download
-     * asynchronously with User-Agent spoofing and multi-URL fallback.
-     * OuiDatabase is already started in the constructor — this just logs progress.
-     */
     private void downloadAndCacheIeeeOui() {
-        // OuiDatabase already started its own background thread in its constructor.
-        // We just wait and log when it has populated enough entries.
         try {
             int waited = 0;
             while (ouiDatabase.getEntryCount() < 10_000 && waited < 60_000) {
@@ -483,10 +605,8 @@ public class Rat {
 
     private String getVendorFromBssid(String bssid) {
         if (bssid == null) return null;
-        // First try OuiDatabase (has full 39K IEEE entries after download)
         String v = ouiDatabase.lookup(bssid);
         if (v != null) return v;
-        // Then try local ouiMap seed (instant, no I/O)
         String c = bssid.replace(":", "").replace("-", "").toUpperCase();
         return c.length() >= 6 ? ouiMap.get(c.substring(0, 6)) : null;
     }
@@ -537,8 +657,7 @@ public class Rat {
     }
 
     // ── Dashboard HTML ──────────────────────────────────────────────────────────
-    // BLACK ICE v2 — upgraded cyberpunk dashboard with matrix rain, GPS wiring,
-    // typewriter boot, radar sweep, and async operator position tracking.
+    // BLACK ICE v2 — CartoDB Dark Matter tiles + ROOM MODE proximity radar
     private static final String DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en"><head>
@@ -615,10 +734,29 @@ body{
 #map{
   position:fixed;inset:0;
   z-index:0;
-  filter:hue-rotate(105deg) saturate(0.25) brightness(0.4) contrast(1.4);
+  filter:saturate(0.15) brightness(0.55) contrast(1.5);
+  transition:opacity 0.5s;
+}
+#map.hidden{ opacity:0; pointer-events:none; }
+
+/* ── ROOM MODE RADAR ── */
+#room-radar{
+  position:fixed;inset:0;
+  z-index:0;
+  background:radial-gradient(ellipse at center, #010d04 0%, #020d05 100%);
+  display:none;
+  align-items:center;
+  justify-content:center;
+}
+#room-radar.active{ display:flex; }
+
+#radar-canvas{
+  position:absolute;
+  top:50%; left:50%;
+  transform:translate(-50%,-50%);
 }
 
-/* ── RADAR SWEEP ── */
+/* ── RADAR RING (map pulse) ── */
 #radar-ring{
   position:fixed;
   z-index:5;
@@ -722,6 +860,70 @@ body{
 .btn:hover::before{transform:translateX(0);}
 .btn.on{background:var(--g);color:#000;}
 
+/* Room mode button active state */
+.btn.room-active{
+  background:var(--c);color:#000;border-color:var(--c);
+  box-shadow:var(--glow-c);
+  animation:none;
+}
+.btn.room-active::before{ background:var(--c); }
+
+/* Survey mode button active state */
+.btn.survey-active{
+  background:var(--y);color:#000;border-color:var(--y);
+  box-shadow:0 0 10px var(--y),0 0 30px #ffe60044;
+  animation:surveypulse 1s infinite;
+}
+.btn.survey-active::before{ background:var(--y); }
+@keyframes surveypulse{0%,100%{box-shadow:0 0 10px var(--y),0 0 30px #ffe60044}50%{box-shadow:0 0 18px var(--y),0 0 50px #ffe60088}}
+
+/* Survey stat */
+.stat-val.survey{ color:var(--y); text-shadow:0 0 10px var(--y),0 0 30px #ffe60044; }
+
+/* ── SURVEY HEATMAP LEGEND ── */
+#survey-legend{
+  position:fixed;
+  bottom:68px;right:12px;
+  z-index:600;
+  font-size:9px;
+  letter-spacing:2px;
+  display:none;
+  flex-direction:column;
+  gap:4px;
+  background:rgba(2,13,5,0.92);
+  border:1px solid rgba(255,230,0,0.4);
+  padding:10px 14px;
+  box-shadow:0 0 12px #ffe60033;
+}
+#survey-legend.active{ display:flex; }
+.survey-legend-title{
+  font-family:'Bebas Neue',monospace;font-size:12px;letter-spacing:3px;
+  color:var(--y);text-shadow:0 0 8px var(--y);margin-bottom:4px;
+}
+.survey-ap-row{
+  display:flex;align-items:center;gap:6px;cursor:crosshair;padding:2px 0;
+  font-size:9px;letter-spacing:1px;
+}
+.survey-ap-row:hover{ color:var(--g); }
+.survey-ap-dot{ width:8px;height:8px;border-radius:50%;flex-shrink:0; }
+#survey-reading-cnt{
+  font-family:'Bebas Neue',monospace;font-size:11px;color:#ffe600aa;
+  margin-top:6px;border-top:1px solid #ffe60033;padding-top:6px;
+  display:flex;justify-content:space-between;align-items:center;gap:12px;
+}
+.survey-dl-btn{
+  font-size:8px;letter-spacing:2px;color:#ffe600;border:1px solid #ffe60055;
+  padding:2px 7px;cursor:crosshair;background:transparent;
+  font-family:'JetBrains Mono',monospace;
+}
+.survey-dl-btn:hover{background:#ffe60022;}
+.survey-clear-btn{
+  font-size:8px;letter-spacing:2px;color:#ff3c00;border:1px solid #ff3c0055;
+  padding:2px 7px;cursor:crosshair;background:transparent;
+  font-family:'JetBrains Mono',monospace;
+}
+.survey-clear-btn:hover{background:#ff3c0022;}
+
 /* ── SIDE PANEL ── */
 #panel{
   position:fixed;top:52px;right:0;bottom:60px;
@@ -807,6 +1009,46 @@ body{
 .sb span:nth-child(3){height:75%}
 .sb span:nth-child(4){height:100%}
 
+/* ── ROOM MODE TOOLTIP ── */
+#radar-tooltip{
+  position:fixed;
+  background:rgba(2,13,5,0.95);
+  border:1px solid var(--b2);
+  padding:8px 12px;
+  font-size:10px;
+  pointer-events:none;
+  z-index:600;
+  display:none;
+  min-width:200px;
+  box-shadow:var(--glow);
+}
+#radar-tooltip .tt-ssid{
+  font-family:'Bebas Neue',monospace;
+  font-size:16px;
+  letter-spacing:3px;
+  color:var(--g);
+  text-shadow:var(--glow);
+}
+
+/* ── ROOM MODE LEGEND ── */
+#radar-legend{
+  position:fixed;
+  bottom:68px;left:12px;
+  z-index:600;
+  font-size:9px;
+  letter-spacing:2px;
+  color:var(--g3);
+  display:none;
+  flex-direction:column;
+  gap:4px;
+  background:rgba(2,13,5,0.85);
+  border:1px solid var(--b2);
+  padding:8px 12px;
+}
+#radar-legend.active{ display:flex; }
+.leg-row{ display:flex;align-items:center;gap:8px; }
+.leg-dot{ width:8px;height:8px;border-radius:50%;flex-shrink:0; }
+
 /* ── LEAFLET ── */
 .leaflet-popup-content-wrapper{
   background:transparent!important;border:none!important;
@@ -868,6 +1110,39 @@ body{
 <div id="map"></div>
 <div id="radar-ring"></div>
 
+<!-- Room Mode Radar -->
+<div id="room-radar">
+  <canvas id="radar-canvas"></canvas>
+</div>
+
+<!-- Room Mode Tooltip -->
+<div id="radar-tooltip">
+  <div class="tt-ssid" id="tt-ssid"></div>
+  <div id="tt-body" style="color:#00cc55;margin-top:4px;line-height:1.6;"></div>
+</div>
+
+<!-- Room Mode Legend -->
+<div id="radar-legend">
+  <div style="font-family:'Bebas Neue',monospace;font-size:11px;letter-spacing:3px;color:var(--g);margin-bottom:4px;">SIGNAL PROXIMITY</div>
+  <div class="leg-row"><div class="leg-dot" style="background:#0aff6e;box-shadow:0 0 5px #0aff6e"></div><span style="color:#00cc55">STRONG  &gt; -55 dBm  (SAME ROOM)</span></div>
+  <div class="leg-row"><div class="leg-dot" style="background:#ffe600;box-shadow:0 0 5px #ffe600"></div><span style="color:#00cc55">MEDIUM  -55 to -70 dBm  (NEARBY)</span></div>
+  <div class="leg-row"><div class="leg-dot" style="background:#ff3c00;box-shadow:0 0 5px #ff3c00"></div><span style="color:#00cc55">WEAK   &lt; -70 dBm  (DISTANT)</span></div>
+  <div class="leg-row" style="margin-top:4px;"><div class="leg-dot" style="background:transparent;border:1px solid #ff3c00;"></div><span style="color:#ff3c0099">OPEN NETWORK</span></div>
+</div>
+
+<!-- Survey heatmap legend / controls -->
+<div id="survey-legend">
+  <div class="survey-legend-title">&#9678; WALK SURVEY</div>
+  <div id="survey-ap-filter" style="display:flex;flex-direction:column;gap:3px;max-height:160px;overflow-y:auto;"></div>
+  <div id="survey-reading-cnt">
+    <span id="survey-reading-label">0 READINGS</span>
+    <div style="display:flex;gap:6px;">
+      <button class="survey-dl-btn" onclick="surveyDownload()">&#8595; CSV</button>
+      <button class="survey-clear-btn" onclick="surveyClear()">&#10005; CLEAR</button>
+    </div>
+  </div>
+</div>
+
 <div class="tgt tl"></div><div class="tgt tr"></div>
 <div class="tgt bl"></div><div class="tgt br"></div>
 
@@ -886,8 +1161,12 @@ body{
   <div class="hdr-sep"></div>
   <div id="clock">00:00:00</div>
   <div class="hdr-right">
+    <div class="stat"><div class="stat-lbl">READINGS</div><div class="stat-val survey" id="survey-cnt">0</div></div>
+    <div class="hdr-sep"></div>
     <div id="sse-status" class="pill wait"><div class="pill-dot"></div>CONNECTING</div>
     <div class="hdr-sep"></div>
+    <button class="btn" id="survey-btn" onclick="toggleSurvey()">&#9678; SURVEY</button>
+    <button class="btn" id="room-btn" onclick="toggleRoomMode()">&#9673; ROOM MODE</button>
     <button class="btn" id="panel-btn" onclick="togglePanel()">&#9776; TARGETS</button>
   </div>
 </div>
@@ -936,7 +1215,7 @@ body{
 })();
 
 // ═══════════════════════════════════════════════════════════════
-// RADAR RING (grows and fades from operator position)
+// RADAR RING (pulse from operator position on the map)
 // ═══════════════════════════════════════════════════════════════
 let radarCenter = {x: innerWidth/2, y: innerHeight/2};
 (function(){
@@ -974,14 +1253,302 @@ function updateClock(){
 setInterval(updateClock,1000); updateClock();
 
 // ═══════════════════════════════════════════════════════════════
-// MAP
+// MAP  —  CartoDB Dark Matter tiles
 // ═══════════════════════════════════════════════════════════════
 const map = L.map('map',{zoomControl:true,attributionControl:false}).setView([-15.3875,28.3228],15);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{
+  maxZoom:19,
+  subdomains:'abcd'
+}).addTo(map);
 
 const markers={}, pulseRings={};
 let allAps={}, panelOpen=false, reconnects=0;
 let operatorMarker=null, operatorLatLng=null, gpsLocked=false;
+
+// ═══════════════════════════════════════════════════════════════
+// ROOM MODE STATE
+// ═══════════════════════════════════════════════════════════════
+let roomMode = false;
+let radarAnimId = null;
+let radarSweepAngle = 0;
+// Wobble offsets per AP key so they don't stack perfectly
+const radarWobble = {};
+
+function toggleRoomMode(){
+  roomMode = !roomMode;
+  const btn = document.getElementById('room-btn');
+  const mapEl = document.getElementById('map');
+  const radarEl = document.getElementById('room-radar');
+  const legend = document.getElementById('radar-legend');
+
+  if(roomMode){
+    btn.classList.add('room-active');
+    mapEl.classList.add('hidden');
+    radarEl.classList.add('active');
+    legend.classList.add('active');
+    addLog('MODE','ROOM MODE ENGAGED — SIGNAL PROXIMITY RADAR','n');
+    startRoomRadar();
+  } else {
+    btn.classList.remove('room-active');
+    mapEl.classList.remove('hidden');
+    radarEl.classList.remove('active');
+    legend.classList.remove('active');
+    document.getElementById('radar-tooltip').style.display='none';
+    if(radarAnimId){ cancelAnimationFrame(radarAnimId); radarAnimId=null; }
+    addLog('MODE','MAP MODE RESTORED','i');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ROOM MODE RADAR — canvas-based proximity radar
+// ═══════════════════════════════════════════════════════════════
+function startRoomRadar(){
+  const canvas = document.getElementById('radar-canvas');
+  const ctx = canvas.getContext('2d');
+
+  function resize(){
+    const w = window.innerWidth;
+    const h = window.innerHeight - 52 - 60; // subtract header + log
+    canvas.width  = w;
+    canvas.height = h;
+    canvas.style.top  = '52px';
+    canvas.style.left = '0';
+    canvas.style.transform = 'none';
+    canvas.style.position = 'fixed';
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  const cx = () => canvas.width  / 2;
+  const cy = () => canvas.height / 2;
+
+  // Max radius — use 85% of the smaller half-dimension
+  const maxR = () => Math.min(canvas.width, canvas.height) * 0.42;
+
+  // Map signal dBm → radius on radar
+  // -30 dBm (strongest practical) → inner ring (0.10 of maxR)
+  // -90 dBm (noise floor) → outer ring (0.95 of maxR)
+  function sigToRadius(dbm){
+    const clamped = Math.max(-95, Math.min(-25, dbm));
+    const t = (clamped - (-25)) / ((-95) - (-25)); // 0=strong/center … 1=weak/edge
+    const r = maxR();
+    return r * (0.12 + t * 0.82);
+  }
+
+  // Hit-test AP blobs for tooltip
+  const blobPositions = {};
+
+  function drawFrame(){
+    if(!roomMode){ return; }
+    radarAnimId = requestAnimationFrame(drawFrame);
+
+    const W = canvas.width, H = canvas.height;
+    const X = cx(), Y = cy(), R = maxR();
+
+    ctx.clearRect(0,0,W,H);
+
+    // ── Background gradient ──
+    const bg = ctx.createRadialGradient(X,Y,0, X,Y,R*1.1);
+    bg.addColorStop(0,   '#010f06');
+    bg.addColorStop(0.7, '#020d05');
+    bg.addColorStop(1,   '#000a03');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0,0,W,H);
+
+    // ── Concentric range rings ──
+    const rings = [
+      { t: 0.15, label:'-35 dBm', col:'rgba(10,255,110,0.5)' },
+      { t: 0.35, label:'-50 dBm', col:'rgba(10,255,110,0.3)' },
+      { t: 0.55, label:'-65 dBm', col:'rgba(255,230,0,0.25)' },
+      { t: 0.75, label:'-75 dBm', col:'rgba(255,60,0,0.2)'   },
+      { t: 0.95, label:'-90 dBm', col:'rgba(255,60,0,0.12)'  },
+    ];
+    rings.forEach(ring=>{
+      const r = R * ring.t;
+      ctx.beginPath();
+      ctx.arc(X,Y,r,0,Math.PI*2);
+      ctx.strokeStyle = ring.col;
+      ctx.lineWidth   = 1;
+      ctx.setLineDash([4,6]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      // Label
+      ctx.fillStyle = ring.col.replace(/[\\d.]+\\)$/, '0.55)');
+      ctx.font = '9px JetBrains Mono, monospace';
+      ctx.fillText(ring.label, X + r + 4, Y - 4);
+    });
+
+    // ── Cross-hairs ──
+    ctx.strokeStyle = 'rgba(10,255,110,0.12)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3,8]);
+    ctx.beginPath(); ctx.moveTo(X,Y-R*1.05); ctx.lineTo(X,Y+R*1.05); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(X-R*1.05,Y); ctx.lineTo(X+R*1.05,Y); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // ── Outer border circle ──
+    ctx.beginPath();
+    ctx.arc(X,Y,R,0,Math.PI*2);
+    ctx.strokeStyle = 'rgba(10,255,110,0.3)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // ── Sweep line ──
+    radarSweepAngle = (radarSweepAngle + 0.018) % (Math.PI*2);
+    const sweepGrad = ctx.createConicalGradient
+      ? ctx.createConicalGradient(radarSweepAngle, X, Y)
+      : null;
+
+    // Draw sweep as a filled wedge (no conical gradient in standard Canvas API)
+    const sweepWidth = Math.PI / 8;
+    ctx.beginPath();
+    ctx.moveTo(X, Y);
+    ctx.arc(X, Y, R, radarSweepAngle - sweepWidth, radarSweepAngle);
+    ctx.closePath();
+    const sg = ctx.createRadialGradient(X,Y,0, X,Y,R);
+    sg.addColorStop(0,   'rgba(10,255,110,0.0)');
+    sg.addColorStop(0.6, 'rgba(10,255,110,0.05)');
+    sg.addColorStop(1,   'rgba(10,255,110,0.13)');
+    ctx.fillStyle = sg;
+    ctx.fill();
+
+    // Bright leading edge
+    ctx.beginPath();
+    ctx.moveTo(X, Y);
+    ctx.lineTo(X + R * Math.cos(radarSweepAngle), Y + R * Math.sin(radarSweepAngle));
+    ctx.strokeStyle = 'rgba(10,255,110,0.7)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // ── AP blobs ──
+    const aps = Object.entries(allAps).sort((a,b)=>a[1].signal - b[1].signal); // weak first = drawn below
+    aps.forEach(([key, ap])=>{
+      // Assign stable wobble so APs at same signal don't perfectly overlap
+      if(!radarWobble[key]){
+        radarWobble[key] = { a: Math.random() * Math.PI*2, drift: (Math.random()-0.5)*0.004 };
+      }
+      radarWobble[key].a += radarWobble[key].drift;
+
+      const dist = sigToRadius(ap.signal);
+      const angle = radarWobble[key].a;
+      const bx = X + dist * Math.cos(angle);
+      const by = Y + dist * Math.sin(angle);
+
+      blobPositions[key] = { x:bx, y:by, ap };
+
+      const isOpen = ap.security && (ap.security.includes('OPEN') || ap.security === '');
+      const col    = ap.signal > -55 ? '#0aff6e' : ap.signal > -70 ? '#ffe600' : '#ff3c00';
+      const glow   = ap.signal > -55 ? '0 0 12px #0aff6e' : ap.signal > -70 ? '0 0 10px #ffe600' : '0 0 8px #ff3c00';
+      const radius = ap.signal > -55 ? 8 : ap.signal > -70 ? 6 : 5;
+
+      // Open network outer warning ring
+      if(isOpen){
+        ctx.beginPath();
+        ctx.arc(bx, by, radius+7, 0, Math.PI*2);
+        ctx.strokeStyle = 'rgba(255,60,0,0.5)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3,3]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // Glow halo
+      const halo = ctx.createRadialGradient(bx,by,0, bx,by,radius*3);
+      halo.addColorStop(0,   col + 'cc');
+      halo.addColorStop(0.4, col + '44');
+      halo.addColorStop(1,   col + '00');
+      ctx.beginPath();
+      ctx.arc(bx, by, radius*3, 0, Math.PI*2);
+      ctx.fillStyle = halo;
+      ctx.fill();
+
+      // Core dot
+      ctx.beginPath();
+      ctx.arc(bx, by, radius, 0, Math.PI*2);
+      ctx.fillStyle = col;
+      ctx.fill();
+
+      // SSID label
+      const label = ap.ssid && ap.ssid !== '<hidden>' ? ap.ssid : '< HIDDEN >';
+      ctx.font = 'bold 10px JetBrains Mono, monospace';
+      ctx.fillStyle = col;
+      ctx.globalAlpha = 0.85;
+      // Offset label to avoid overlap with dot
+      const lx = bx + radius + 5;
+      const ly = by - 4;
+      // Shadow for legibility
+      ctx.shadowColor = '#020d05';
+      ctx.shadowBlur  = 6;
+      ctx.fillText(label, lx, ly);
+      ctx.fillStyle = 'rgba(10,255,110,0.4)';
+      ctx.font = '8px JetBrains Mono, monospace';
+      ctx.fillText(ap.signal + ' dBm', lx, ly + 12);
+      ctx.shadowBlur  = 0;
+      ctx.globalAlpha = 1;
+    });
+
+    // ── Centre "YOU ARE HERE" crosshair ──
+    ctx.beginPath();
+    ctx.arc(X,Y,6,0,Math.PI*2);
+    ctx.strokeStyle = '#00e5ff';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(X,Y,2,0,Math.PI*2);
+    ctx.fillStyle = '#00e5ff';
+    ctx.fill();
+    // pulsing outer ring
+    const pulse = 0.5 + 0.5*Math.sin(Date.now()/400);
+    ctx.beginPath();
+    ctx.arc(X,Y,10 + pulse*5,0,Math.PI*2);
+    ctx.strokeStyle = `rgba(0,229,255,${0.3*pulse})`;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // ── Title ──
+    ctx.font = '700 11px JetBrains Mono, monospace';
+    ctx.fillStyle = 'rgba(10,255,110,0.35)';
+    ctx.fillText('ROOM MODE // SIGNAL PROXIMITY RADAR', X - 170, 28);
+  }
+
+  drawFrame();
+
+  // ── Tooltip on hover ──
+  const tooltip = document.getElementById('radar-tooltip');
+  canvas.addEventListener('mousemove', e=>{
+    if(!roomMode) return;
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    let hit = null;
+    for(const [key, pos] of Object.entries(blobPositions)){
+      const dx = mx - pos.x, dy = my - pos.y;
+      if(Math.sqrt(dx*dx+dy*dy) < 18){ hit = pos.ap; break; }
+    }
+    if(hit){
+      const isOpen = hit.security && (hit.security.includes('OPEN') || hit.security === '');
+      const col = hit.signal > -55 ? '#0aff6e' : hit.signal > -70 ? '#ffe600' : '#ff3c00';
+      const prox = hit.signal > -55 ? 'SAME ROOM' : hit.signal > -65 ? 'VERY CLOSE' : hit.signal > -75 ? 'NEARBY' : 'DISTANT';
+      document.getElementById('tt-ssid').textContent = hit.ssid || '<HIDDEN>';
+      document.getElementById('tt-ssid').style.color = isOpen ? '#ff3c00' : col;
+      document.getElementById('tt-body').innerHTML =
+        `<span style="color:#3db869">BSSID</span>  ${hit.bssid}<br>`+
+        `<span style="color:#3db869">SIGNAL</span> <span style="color:${col}">${hit.signal} dBm</span><br>`+
+        `<span style="color:#3db869">PROX</span>   <span style="color:${col}">${prox}</span><br>`+
+        `<span style="color:#3db869">CH</span>     ${hit.channel}<br>`+
+        `<span style="color:#3db869">ENC</span>    <span style="color:${isOpen?'#ff3c00':'#0aff6e'}">${hit.security||'OPEN'}</span><br>`+
+        `<span style="color:#3db869">VENDOR</span> ${hit.vendor||'?'}`;
+      tooltip.style.display = 'block';
+      let tx = e.clientX + 18, ty = e.clientY - 10;
+      if(tx + 220 > window.innerWidth) tx = e.clientX - 230;
+      tooltip.style.left = tx + 'px';
+      tooltip.style.top  = ty + 'px';
+    } else {
+      tooltip.style.display = 'none';
+    }
+  });
+  canvas.addEventListener('mouseleave', ()=>{ tooltip.style.display='none'; });
+}
 
 // ═══════════════════════════════════════════════════════════════
 // OPERATOR MARKER
@@ -1014,17 +1581,16 @@ function updateOperatorMarker(lat,lon,gps){
     operatorMarker.setLatLng([lat,lon]);
     operatorMarker.setIcon(makeOperatorIcon(gps));
   }
-  // Update radar center
   const pt = map.latLngToContainerPoint([lat,lon]);
   radarCenter = {x:pt.x, y:pt.y};
 }
 
 // ═══════════════════════════════════════════════════════════════
-// BROWSER GEOLOCATION fallback (used until GPS or SSE provides coords)
+// BROWSER GEOLOCATION fallback
 // ═══════════════════════════════════════════════════════════════
 if(navigator.geolocation){
   navigator.geolocation.watchPosition(pos=>{
-    if(gpsLocked) return; // hardware GPS takes priority
+    if(gpsLocked) return;
     const {latitude:lat,longitude:lon} = pos.coords;
     map.setView([lat,lon],16);
     updateOperatorMarker(lat,lon,false);
@@ -1089,11 +1655,11 @@ function renderPanel(){
       '<span class="mac">'+ap.bssid+'</span>'+
       '<span>'+sigBars(ap.signal,sc)+' '+ap.signal+'dBm</span>'+
       '<span>CH:'+ap.channel+'</span>'+
-      '<span>'+( ap.vendor||'?')+'</span>'+
+      '<span>'+(ap.vendor||'?')+'</span>'+
       '<span style="color:#003d11;font-size:8px">'+(ap.source||'')+'</span>'+
       '</div>';
     d.onclick=()=>{
-      if(markers[key]){ map.flyTo([ap.lat,ap.lon],17,{duration:0.7}); markers[key].openPopup(); }
+      if(!roomMode && markers[key]){ map.flyTo([ap.lat,ap.lon],17,{duration:0.7}); markers[key].openPopup(); }
     };
     list.appendChild(d);
   });
@@ -1121,7 +1687,6 @@ function makePopup(ap){
   const isWPA2  = ap.security && ap.security.includes('WPA2') && !isWPA3;
   const isHidden= !ap.ssid || ap.ssid === '<hidden>';
 
-  // Threat score 0-100
   let threat = 0;
   if (isOpen)          threat += 60;
   if (isHidden)        threat += 15;
@@ -1155,8 +1720,6 @@ function makePopup(ap){
 
   return `
 <div style="font-family:JetBrains Mono,monospace;background:#020d05;border:1px solid ${mCol}66;min-width:280px;overflow:hidden;">
-
-  <!-- HEADER -->
   <div style="background:linear-gradient(135deg,${mCol}22,${mCol}08);border-bottom:1px solid ${mCol}44;padding:10px 12px 8px;">
     <div style="font-family:'Bebas Neue',cursive,monospace;font-size:20px;letter-spacing:4px;color:${mCol};text-shadow:0 0 10px ${mCol};line-height:1.1;">
       ${ssidDisplay}
@@ -1168,8 +1731,6 @@ function makePopup(ap){
       ${encBadge}
     </div>
   </div>
-
-  <!-- SIGNAL BAR -->
   <div style="padding:8px 12px 7px;border-bottom:1px solid #0aff6e22;">
     <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
       <span style="font-size:9px;color:#4dcc77;letter-spacing:2px;">SIGNAL STRENGTH</span>
@@ -1179,8 +1740,6 @@ function makePopup(ap){
       <div style="height:100%;width:${sigPct}%;background:linear-gradient(90deg,${sCol}88,${sCol});box-shadow:0 0 5px ${sCol};"></div>
     </div>
   </div>
-
-  <!-- THREAT BAR -->
   <div style="padding:7px 12px;border-bottom:1px solid ${tCol}33;background:${tCol}12;">
     <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
       <span style="font-size:9px;color:#4dcc77;letter-spacing:2px;">THREAT SCORE</span>
@@ -1190,39 +1749,19 @@ function makePopup(ap){
       <div style="height:100%;width:${threat}%;background:linear-gradient(90deg,${tCol}88,${tCol});box-shadow:0 0 4px ${tCol};"></div>
     </div>
   </div>
-
-  <!-- DATA TABLE -->
   <div style="padding:8px 12px 10px;">
     <table style="width:100%;border-collapse:collapse;font-size:10px;">
-      <tr>
-        <td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Vendor</td>
-        <td style="color:#00ccff;padding:3px 0;font-weight:bold;">${ap.vendor || 'UNKNOWN'}</td>
-      </tr>
-      <tr>
-        <td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Channel</td>
-        <td style="color:#0aff6e;padding:3px 0;">${ap.channel > 0 ? ap.channel : '?'} <span style="color:#5aaa77;font-size:9px;">${band} // ${freq}</span></td>
-      </tr>
-      <tr>
-        <td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Encryption</td>
-        <td style="color:${mCol};padding:3px 0;font-weight:bold;">${ap.security || 'NONE'}</td>
-      </tr>
-      <tr>
-        <td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Geo Source</td>
-        <td style="color:#7acc99;padding:3px 0;font-size:9px;">${ap.source || '---'}</td>
-      </tr>
-      <tr>
-        <td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Coords</td>
-        <td style="color:#5aaa77;padding:3px 0;font-size:9px;">${lat6}, ${lon6}</td>
-      </tr>
+      <tr><td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Vendor</td><td style="color:#00ccff;padding:3px 0;font-weight:bold;">${ap.vendor || 'UNKNOWN'}</td></tr>
+      <tr><td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Channel</td><td style="color:#0aff6e;padding:3px 0;">${ap.channel > 0 ? ap.channel : '?'} <span style="color:#5aaa77;font-size:9px;">${band} // ${freq}</span></td></tr>
+      <tr><td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Encryption</td><td style="color:${mCol};padding:3px 0;font-weight:bold;">${ap.security || 'NONE'}</td></tr>
+      <tr><td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Geo Source</td><td style="color:#7acc99;padding:3px 0;font-size:9px;">${ap.source || '---'}</td></tr>
+      <tr><td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Coords</td><td style="color:#5aaa77;padding:3px 0;font-size:9px;">${lat6}, ${lon6}</td></tr>
     </table>
   </div>
-
-  <!-- FOOTER -->
   <div style="border-top:1px solid #0aff6e22;padding:5px 12px;display:flex;justify-content:space-between;background:#0aff6e0a;">
     <span style="font-size:8px;color:#3d7a50;letter-spacing:3px;">BLACK ICE v2</span>
     <span style="font-size:8px;color:${mCol}aa;letter-spacing:1px;">NIGHTFALL35</span>
   </div>
-
 </div>`;
 }
 
@@ -1235,45 +1774,56 @@ function updateDisplay(aps){
   updateThreat(aps);
   if(panelOpen) renderPanel();
 
-  Object.entries(aps).forEach(([key,ap])=>{
-    const isOpen=ap.security&&(ap.security.includes('OPEN')||ap.security==='');
-    const strong=ap.signal>-65;
-    const col=isOpen?'#ff3c00':strong?'#0aff6e':'#ffe600';
-    const r=isOpen?11:strong?8:6;
+  // Only update map markers when not in room mode
+  if(!roomMode){
+    Object.entries(aps).forEach(([key,ap])=>{
+      const isOpen=ap.security&&(ap.security.includes('OPEN')||ap.security==='');
+      const strong=ap.signal>-65;
+      const col=isOpen?'#ff3c00':strong?'#0aff6e':'#ffe600';
+      const r=isOpen?11:strong?8:6;
 
-    if(markers[key]){
-      markers[key].setLatLng([ap.lat,ap.lon]);
-      markers[key].setStyle({color:col,fillColor:col,radius:r});
-      markers[key].setPopupContent(makePopup(ap));
-    } else {
-      addLog('SIG',(ap.ssid||'<HIDDEN>')+' ['+ap.bssid+'] '+ap.signal+'dBm',isOpen?'c':'n');
-      const m=L.circleMarker([ap.lat,ap.lon],{
-        radius:r,color:col,fillColor:col,fillOpacity:0.8,weight:1.5
-      }).addTo(map);
-      m.bindPopup(makePopup(ap), {maxWidth: 320, minWidth: 280});
-      markers[key]=m;
-
-      if(isOpen){
-        const ring=L.circleMarker([ap.lat,ap.lon],{
-          radius:r+8,color:'#ff3c00',fillColor:'transparent',weight:1,opacity:0.5
+      if(markers[key]){
+        markers[key].setLatLng([ap.lat,ap.lon]);
+        markers[key].setStyle({color:col,fillColor:col,radius:r});
+        markers[key].setPopupContent(makePopup(ap));
+      } else {
+        addLog('SIG',(ap.ssid||'<HIDDEN>')+' ['+ap.bssid+'] '+ap.signal+'dBm',isOpen?'c':'n');
+        const m=L.circleMarker([ap.lat,ap.lon],{
+          radius:r,color:col,fillColor:col,fillOpacity:0.8,weight:1.5
         }).addTo(map);
-        pulseRings[key]=ring;
-        // CSS pulse on the SVG element
-        setTimeout(()=>{
-          const el=ring.getElement();
-          if(el){el.style.animation='blinkbadge 1.4s ease-out infinite';}
-        },50);
-      }
-    }
-  });
+        m.bindPopup(makePopup(ap), {maxWidth: 320, minWidth: 280});
+        markers[key]=m;
 
-  // Remove stale markers
-  Object.keys(markers).forEach(key=>{
-    if(!aps[key]){
-      map.removeLayer(markers[key]); delete markers[key];
-      if(pulseRings[key]){map.removeLayer(pulseRings[key]);delete pulseRings[key];}
-    }
-  });
+        if(isOpen){
+          const ring=L.circleMarker([ap.lat,ap.lon],{
+            radius:r+8,color:'#ff3c00',fillColor:'transparent',weight:1,opacity:0.5
+          }).addTo(map);
+          pulseRings[key]=ring;
+          setTimeout(()=>{
+            const el=ring.getElement();
+            if(el){el.style.animation='blinkbadge 1.4s ease-out infinite';}
+          },50);
+        }
+      }
+    });
+
+    Object.keys(markers).forEach(key=>{
+      if(!aps[key]){
+        map.removeLayer(markers[key]); delete markers[key];
+        if(pulseRings[key]){map.removeLayer(pulseRings[key]);delete pulseRings[key];}
+      }
+    });
+  } else {
+    // In room mode just log new APs
+    Object.entries(aps).forEach(([key,ap])=>{
+      if(!markers[key]){
+        // Create a placeholder marker off-screen so panel clicks don't crash
+        const isOpen=ap.security&&(ap.security.includes('OPEN')||ap.security==='');
+        addLog('SIG',(ap.ssid||'<HIDDEN>')+' '+ap.signal+'dBm',isOpen?'c':'n');
+        markers[key] = {_roomPlaceholder:true};
+      }
+    });
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1316,6 +1866,17 @@ function connect(){
       if(d.type==='full'){
         if(d.operator) updateOperator(d.operator);
         updateDisplay(d.aps);
+        // Survey heatmap ingestion — pass operator lat/lon from SSE
+        if(d.survey){
+          const op = d.operator || {};
+          ingestSurveyReadings(d.aps, op.lat, op.lon, d.survey.readings);
+          // Keep survey button in sync if server restarted
+          if(d.survey.active && !surveyMode){
+            document.getElementById('survey-btn').classList.add('survey-active');
+            document.getElementById('survey-legend').classList.add('active');
+            surveyMode = true;
+          }
+        }
       }
     }catch(err){ addLog('ERR','PARSE: '+err.message,'c'); }
   };
@@ -1332,6 +1893,148 @@ connect();
 setInterval(()=>{ if(evt&&evt.readyState===EventSource.CLOSED) connect(); },30000);
 
 // ═══════════════════════════════════════════════════════════════
+// WALK SURVEY — heatmap overlay
+// ═══════════════════════════════════════════════════════════════
+let surveyMode     = false;
+let surveyReadings = 0;
+// surveyData: { bssid -> { ssid, readings:[{lat,lon,rssi}], color, visible } }
+const surveyData   = {};
+const heatLayers   = {}; // bssid -> array of Leaflet circleMarkers
+// Palette for per-AP colouring — cycles through distinct hues
+const surveyPalette = [
+  '#0aff6e','#00e5ff','#ffe600','#ff3c00','#ff00cc','#9900ff',
+  '#00ffcc','#ff9900','#66ff00','#ff0066','#0066ff','#ffcc00'
+];
+let surveyPaletteIdx = 0;
+
+function surveyColorFor(bssid){
+  if(!surveyData[bssid]) surveyData[bssid] = {
+    ssid:'?', readings:[], color: surveyPalette[surveyPaletteIdx++ % surveyPalette.length], visible:true
+  };
+  return surveyData[bssid].color;
+}
+
+function toggleSurvey(){
+  surveyMode = !surveyMode;
+  const btn = document.getElementById('survey-btn');
+  const legend = document.getElementById('survey-legend');
+  if(surveyMode){
+    btn.classList.add('survey-active');
+    legend.classList.add('active');
+    fetch('/survey', {method:'POST', body:'start'});
+    addLog('SURVEY','WALK SURVEY STARTED — move around to build heatmap','w');
+  } else {
+    btn.classList.remove('survey-active');
+    fetch('/survey', {method:'POST', body:'stop'});
+    addLog('SURVEY','WALK SURVEY PAUSED — ' + surveyReadings + ' readings','i');
+  }
+}
+
+function surveyDownload(){
+  window.open('/survey/export','_blank');
+}
+
+function surveyClear(){
+  fetch('/survey', {method:'POST', body:'clear'}).then(()=>{
+    // Remove all heatmap layers from map
+    Object.values(heatLayers).forEach(arr => arr.forEach(l => map.removeLayer(l)));
+    Object.keys(heatLayers).forEach(k => delete heatLayers[k]);
+    Object.keys(surveyData).forEach(k => { surveyData[k].readings = []; });
+    surveyReadings = 0;
+    document.getElementById('survey-cnt').textContent = '0';
+    document.getElementById('survey-reading-label').textContent = '0 READINGS';
+    renderSurveyLegend();
+    addLog('SURVEY','SURVEY DATA CLEARED','w');
+  });
+}
+
+// Called on every SSE update when survey is active
+function ingestSurveyReadings(aps, opLat, opLon, serverReadings){
+  document.getElementById('survey-cnt').textContent = serverReadings;
+  document.getElementById('survey-reading-label').textContent = serverReadings + ' READINGS';
+  surveyReadings = serverReadings;
+
+  if(!surveyMode) return;
+  // Need a GPS fix to record meaningful positions
+  if(!opLat || !opLon) return;
+
+  Object.entries(aps).forEach(([key, ap])=>{
+    if(!surveyData[key]){
+      surveyData[key] = {
+        ssid: ap.ssid || key,
+        readings: [],
+        color: surveyPalette[surveyPaletteIdx++ % surveyPalette.length],
+        visible: true
+      };
+    }
+    surveyData[key].ssid = ap.ssid || key;
+
+    // Deduplicate — only add if moved > ~3m from last reading for this AP
+    const last = surveyData[key].readings[surveyData[key].readings.length - 1];
+    if(last){
+      const dlat = opLat - last.lat, dlon = opLon - last.lon;
+      if(Math.sqrt(dlat*dlat + dlon*dlon) < 0.00003) return; // ~3m threshold
+    }
+
+    surveyData[key].readings.push({lat:opLat, lon:opLon, rssi:ap.signal});
+    drawHeatPoint(key, opLat, opLon, ap.signal);
+  });
+
+  renderSurveyLegend();
+}
+
+function drawHeatPoint(bssid, lat, lon, rssi){
+  if(!surveyData[bssid] || !surveyData[bssid].visible) return;
+  const col   = surveyData[bssid].color;
+  const alpha = rssi > -55 ? 0.75 : rssi > -70 ? 0.55 : 0.35;
+  const r     = rssi > -55 ? 22   : rssi > -70 ? 16   : 10;
+
+  const circle = L.circleMarker([lat, lon], {
+    radius:      r,
+    color:       col,
+    fillColor:   col,
+    fillOpacity: alpha,
+    weight:      0,
+    className:   'survey-point'
+  }).addTo(map);
+
+  circle.bindTooltip(
+    '<span style="font-family:JetBrains Mono,monospace;font-size:10px;color:' + col + '">' +
+    (surveyData[bssid].ssid||bssid) + '<br>' + rssi + ' dBm</span>',
+    {sticky:true, opacity:0.95, className:'survey-tip'}
+  );
+
+  if(!heatLayers[bssid]) heatLayers[bssid] = [];
+  heatLayers[bssid].push(circle);
+}
+
+function renderSurveyLegend(){
+  if(!surveyMode && Object.keys(surveyData).length === 0) return;
+  const container = document.getElementById('survey-ap-filter');
+  container.innerHTML = '';
+  Object.entries(surveyData).forEach(([bssid, d])=>{
+    if(d.readings.length === 0) return;
+    const row = document.createElement('div');
+    row.className = 'survey-ap-row';
+    row.style.color = d.visible ? d.color : '#333';
+    row.innerHTML =
+      '<div class="survey-ap-dot" style="background:' + (d.visible?d.color:'#333') + ';box-shadow:0 0 4px ' + d.color + '"></div>' +
+      '<span>' + (d.ssid&&d.ssid!=='<hidden>'?d.ssid:bssid.slice(-8)) + '</span>' +
+      '<span style="color:#555;margin-left:auto;">' + d.readings.length + '</span>';
+    row.title = bssid;
+    row.onclick = ()=>{
+      d.visible = !d.visible;
+      // Show/hide map layers for this AP
+      if(heatLayers[bssid]) heatLayers[bssid].forEach(l=>{
+        if(d.visible) map.addLayer(l); else map.removeLayer(l);
+      });
+      renderSurveyLegend();
+    };
+    container.appendChild(row);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
 // BOOT TYPEWRITER
 // ═══════════════════════════════════════════════════════════════
 const bootLines=[
@@ -1345,6 +2048,9 @@ const bootLines=[
   '> SSE STREAM: CONNECTED',
   '> SWARM INTELLIGENCE: ARMED',
   '> EVIL TWIN DETECTION: ENABLED',
+  '> MAP TILES: CARTO DARK MATTER',
+  '> ROOM MODE RADAR: READY',
+  '> WALK SURVEY ENGINE: ARMED',
   '',
   '  ALL SYSTEMS NOMINAL. ENTERING SURVEILLANCE MODE.',
   '',
@@ -1368,6 +2074,5 @@ const bootLines=[
 })();
 </script>
 </body></html>
-
 """;
 }
