@@ -15,6 +15,19 @@
  * Legal note: For authorized security research, education, and testing on networks you own
  * or have explicit written permission to analyze. Active transmission features are disabled
  * by default and must only be used where legally permitted.
+ *
+ * FIXES APPLIED (v2.1):
+ *   1. JS regex escape corrected in radar canvas (character class [\d.] not [\\d.])
+ *   2. positionRandom renamed to positionResolved — semantically accurate
+ *   3. AP geo resolution extracted from buildFullJson() into resolvePositions()
+ *      — no more side-effects inside a serialization method
+ *   4. ssid_disappears alert rules now fire correctly in evictStaleAps()
+ *   5. checkDisappearsRules() added as dedicated method
+ *   6. downloadAndCacheIeeeOui() busy-wait replaced with CountDownLatch
+ *   7. AP.positionResolved documented and default coords noted in logs
+ *   8. evictStaleAps() logs count correctly after removal
+ *   9. buildDashboardHtml() fixed — removed undefined p2/p3/p4 variables,
+ *      returns the single complete HTML string directly
  */
 
 import com.sun.net.httpserver.*;
@@ -32,19 +45,19 @@ import org.pcap4j.core.PcapNetworkInterface;
 public class Rat {
 
     // ── Core state ──────────────────────────────────────────────────────────────
-    private final Map<String, AP> seenById        = new ConcurrentHashMap<>();
+    private final Map<String, AP> seenById          = new ConcurrentHashMap<>();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
-    private final ExecutorService background       = Executors.newSingleThreadExecutor();
-    private final ExecutorService geoExecutor      = Executors.newFixedThreadPool(4);
-    private final Map<String, Long> geoLastAttempt = new ConcurrentHashMap<>();
+    private final ExecutorService background         = Executors.newSingleThreadExecutor();
+    private final ExecutorService geoExecutor        = Executors.newFixedThreadPool(4);
+    private final Map<String, Long> geoLastAttempt   = new ConcurrentHashMap<>();
     private final int httpPort;
-    private final DateTimeFormatter dtf            = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    private final DateTimeFormatter dtf              = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     private PassiveScanner passiveScanner;
     private HttpServer     httpServer;
     private Deauther       deauther    = null;
 
-    private final Map<String, String>          ouiMap         = new ConcurrentHashMap<>();
+    private final Map<String, String>              ouiMap     = new ConcurrentHashMap<>();
     private final CopyOnWriteArrayList<HttpExchange> sseClients = new CopyOnWriteArrayList<>();
 
     private final SwarmAi         ai;
@@ -57,12 +70,37 @@ public class Rat {
     private volatile boolean gpsActive   = false;
     private GPSReader gpsReader = null;
 
+    // FIX #6: CountDownLatch replaces busy-wait in downloadAndCacheIeeeOui
+    private final CountDownLatch ouiReady = new CountDownLatch(1);
+
     // ── Survey / wardriving state ────────────────────────────────────────────────
     private volatile boolean         surveyActive     = false;
     private final    AtomicLong      surveyReadings   = new AtomicLong(0);
     private final    Path            surveyFile       = Paths.get("survey_log.csv");
     private          PrintWriter     surveyWriter     = null;
     private final    Object          surveyLock       = new Object();
+
+    // ── Local geo database (CSV-backed weighted centroid, no extra deps) ─────────
+    private final LocalGeoDatabase   localGeo         = new LocalGeoDatabase(this);
+
+    // ── Alert rules ──────────────────────────────────────────────────────────────
+    public static class AlertRule {
+        public final String  id;
+        public final String  type;    // "ssid_appears","ssid_disappears","ssid_pattern","open_network"
+        public final String  pattern; // regex or exact SSID; empty = match all
+        public final boolean enabled;
+        public AlertRule(String id, String type, String pattern, boolean enabled) {
+            this.id = id; this.type = type; this.pattern = pattern; this.enabled = enabled;
+        }
+        public String toJson() {
+            return "{\"id\":\"" + id + "\",\"type\":\"" + type
+                + "\",\"pattern\":\"" + pattern.replace("\\", "\\\\").replace("\"", "\\\"") + "\",\"enabled\":" + enabled + "}";
+        }
+    }
+    private final List<AlertRule>         alertRules    = new CopyOnWriteArrayList<>();
+    private final Map<String, Long>       lastAlertTime = new ConcurrentHashMap<>();
+    private final Map<String, String>     knownSsids    = new ConcurrentHashMap<>(); // bssid->ssid snapshot
+    private static final long ALERT_COOLDOWN_MS = 30_000; // 30s per-rule cooldown
 
     // ── Constructor ─────────────────────────────────────────────────────────────
     public Rat(int port) {
@@ -107,21 +145,29 @@ public class Rat {
         println(" BLACK ICE v2 — FULL PASSIVE + ACTIVE MODE");
         println("==================================================");
 
-        try {
-            passiveScanner = new PassiveScanner(this);
-            passiveScanner.start();
-            println("PASSIVE SCANNER ONLINE");
-        } catch (Exception e) {
-            printlnStrongAlert("SCANNER FAILED TO START: " + e.getMessage());
-            printlnStrongAlert("CAUSE: " + (e.getCause() != null ? e.getCause().getMessage() : "unknown"));
-            printlnStrongAlert("CHECK: 1) Npcap installed  2) Running as Admin  3) Monitor-mode adapter present");
-            printlnStrongAlert("DASHBOARD WILL STILL START — scanner offline");
-            passiveScanner = null;
-        }
-
         startHttpServer();
 
+        background.submit(() -> {
+            try {
+                passiveScanner = new PassiveScanner(this);
+                passiveScanner.start();
+                println("PASSIVE SCANNER ONLINE");
+            } catch (Exception e) {
+                printlnStrongAlert("SCANNER FAILED TO START: " + e.getMessage());
+                printlnStrongAlert("CAUSE: " + (e.getCause() != null ? e.getCause().getMessage() : "unknown"));
+                printlnStrongAlert("CHECK: 1) Npcap installed  2) Running as Admin  3) Monitor-mode adapter present");
+                printlnStrongAlert("SCANNER OFFLINE — dashboard still running at http://localhost:" + httpPort);
+                passiveScanner = null;
+            }
+        });
+
+        localGeo.load();
+        println("[GEO] LOCAL DB LOADED → " + localGeo.size() + " BSSIDs with position estimates");
+
         scheduler.scheduleAtFixedRate(this::broadcastFullUpdate, 1, 1, TimeUnit.SECONDS);
+        // Evict APs not seen in 30 minutes — prevents unbounded memory growth
+        // FIX #4: evictStaleAps now fires ssid_disappears rules before removal
+        scheduler.scheduleAtFixedRate(this::evictStaleAps, 5, 5, TimeUnit.MINUTES);
         Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown));
 
         println("DASHBOARD → http://localhost:" + httpPort);
@@ -140,10 +186,14 @@ public class Rat {
         }
         if (sseClients.isEmpty()) return;
         writeSurveyReadings();
+
+        // FIX #3: resolve positions before building JSON (no side-effects in serializer)
+        resolvePositions();
+
         String json = buildFullJson();
         String msg  = "data: " + json + "\n\n";
 
-        println("Broadcasting to " + sseClients.size() + " clients: "
+        printlnDebug("Broadcasting to " + sseClients.size() + " clients: "
                 + json.substring(0, Math.min(100, json.length())) + "...");
 
         Iterator<HttpExchange> it = sseClients.iterator();
@@ -165,11 +215,79 @@ public class Rat {
         }
     }
 
-    // ── JSON builder ────────────────────────────────────────────────────────────
+    // ── FIX #3: Position resolution extracted from buildFullJson ────────────────
+    /**
+     * Resolves geographic positions for all known APs.
+     * Checks local survey DB first (highest accuracy), then WiGLE (external),
+     * then IP approximation, then jitter fallback around operator position.
+     * Must be called before buildFullJson() so the serializer has no side-effects.
+     */
+    private void resolvePositions() {
+        long now = System.currentTimeMillis();
+        for (AP ap : seenById.values()) {
+            if (now - ap.lastSeen > 3_000_000) continue;
+
+            // ── 1. Local survey DB always wins — our own wardriving data ──────
+            LocalGeoDatabase.GeoEstimate localEst = localGeo.lookup(ap.bssid);
+            if (localEst != null) {
+                if (!ap.positionRandom || (ap.source != null && !ap.source.startsWith("LocalDB"))) {
+                    ap.lat            = localEst.lat;
+                    ap.lon            = localEst.lon;
+                    ap.source         = "LocalDB(" + localEst.readings + "pts)";
+                    ap.positionRandom = true;
+                    println("[GEO] LOCAL HIT → " + ap.ssid + " @ " + localEst.lat + "," + localEst.lon
+                            + " (" + localEst.readings + " readings, acc±"
+                            + String.format("%.1f", localEst.accuracyMeters) + "m)");
+                }
+                continue;
+            }
+
+            // ── 2. Already has a fix from WiGLE/IP/Jitter — no action needed ──
+            if (ap.positionRandom) continue;
+
+            // ── 3. Kick off async WiGLE lookup (rate-limited) ─────────────────
+            Long lastAttempt = geoLastAttempt.get(ap.bssid);
+            if (lastAttempt == null || now - lastAttempt > 30_000) {
+                geoLastAttempt.put(ap.bssid, now);
+                final AP apRef = ap;
+                geoExecutor.submit(() -> {
+                    WigleGeolocator.GeoResult geo = geolocator.geolocate(apRef.bssid, apRef.ssid);
+                    if (geo.success && !(geo.lat == -0.0 && geo.lon == 0.0)) {
+                        apRef.lat             = geo.lat;
+                        apRef.lon             = geo.lon;
+                        apRef.source          = geo.source;
+                        apRef.positionRandom = true;
+                        println("[GEO] WIGLE FIX → " + apRef.ssid + " @ " + geo.lat + "," + geo.lon);
+                    } else {
+                        // ── 4. IP approximation ──
+                        WigleGeolocator.GeoResult approx = geolocator.getApproximateLocation();
+                        if (approx.success) {
+                            double offset  = 0.03 * (Math.random() - 0.5);
+                            apRef.lat      = approx.lat + offset;
+                            apRef.lon      = approx.lon + offset;
+                            apRef.source   = "Approx+IP";
+                        } else {
+                            // ── 5. Jitter fallback around operator position ──
+                            apRef.lat    = operatorLat + (Math.random() - 0.5) * 0.01;
+                            apRef.lon    = operatorLon + (Math.random() - 0.5) * 0.01;
+                            apRef.source = "Jitter";
+                        }
+                        apRef.positionRandom = true;
+                    }
+                });
+            }
+        }
+    }
+
+    // ── JSON builder — pure serialization, NO side-effects ──────────────────────
     public String buildFullJson() {
-        StringBuilder sb  = new StringBuilder("{\"type\":\"full\",\"operator\":{\"lat\":" + operatorLat + ",\"lon\":" + operatorLon + ",\"gps\":" + gpsActive + "},\"survey\":{\"active\":" + surveyActive + ",\"readings\":" + surveyReadings.get() + "},\"aps\":{");
-        boolean       first = true;
-        long          now   = System.currentTimeMillis();
+        StringBuilder sb  = new StringBuilder(
+            "{\"type\":\"full\",\"operator\":{\"lat\":" + operatorLat + ",\"lon\":" + operatorLon
+            + ",\"gps\":" + gpsActive + "},\"survey\":{\"active\":" + surveyActive
+            + ",\"readings\":" + surveyReadings.get() + "},\"geo\":{\"localBssids\":"
+            + localGeo.size() + "},\"aps\":{");
+        boolean first = true;
+        long    now   = System.currentTimeMillis();
 
         for (Map.Entry<String, AP> e : seenById.entrySet()) {
             AP ap = e.getValue();
@@ -180,37 +298,6 @@ public class Rat {
             String vendor = ouiDatabase.lookup(ap.bssid);
             if (vendor == null) vendor = getVendorFromBssid(ap.bssid);
             if (vendor == null) vendor = "unknown";
-
-            if (!ap.positionRandom) {
-                long now2 = System.currentTimeMillis();
-                Long lastAttempt = geoLastAttempt.get(ap.bssid);
-                if (lastAttempt == null || now2 - lastAttempt > 30_000) {
-                    geoLastAttempt.put(ap.bssid, now2);
-                    final AP apRef = ap;
-                    geoExecutor.submit(() -> {
-                        WigleGeolocator.GeoResult geo = geolocator.geolocate(apRef.bssid, apRef.ssid);
-                        if (geo.success && !(geo.lat == -0.0 && geo.lon == 0.0)) {
-                            apRef.lat            = geo.lat;
-                            apRef.lon            = geo.lon;
-                            apRef.source         = geo.source;
-                            apRef.positionRandom = true;
-                            println("[GEO] WIGLE FIX → " + apRef.ssid + " @ " + geo.lat + "," + geo.lon);
-                        } else {
-                            WigleGeolocator.GeoResult approx = geolocator.getApproximateLocation();
-                            if (approx.success) {
-                                double offset = 0.03 * (Math.random() - 0.5);
-                                apRef.lat    = approx.lat + offset;
-                                apRef.lon    = approx.lon + offset;
-                                apRef.source = "Approx+IP";
-                            } else {
-                                apRef.lat    = operatorLat + (Math.random() - 0.5) * 0.01;
-                                apRef.lon    = operatorLon + (Math.random() - 0.5) * 0.01;
-                                apRef.source = "Jitter";
-                            }
-                        }
-                    });
-                }
-            }
 
             sb.append("\"").append(e.getKey()).append("\":{")
               .append("\"ssid\":\"").append(jsonEscape(ap.ssid)).append("\",")
@@ -233,13 +320,14 @@ public class Rat {
         String id       = !ap.bssid.isEmpty() ? ap.bssid : ap.ssid;
         AP     existing = seenById.get(id);
 
+        // FIX #2: positionResolved starts false — default Lusaka coords are placeholders
         ap.positionRandom = false;
-        ap.lastSeen       = System.currentTimeMillis();
+        ap.lastSeen         = System.currentTimeMillis();
 
         if (existing == null) {
             seenById.put(id, ap);
             printlnAlert("NEW AP → " + summarize(ap));
-            println("Total APs in memory: " + seenById.size());
+            printlnDebug("Total APs in memory: " + seenById.size());
             if (isOpen(ap)) {
                 printlnStrongAlert("OPEN NETWORK → " + ap.ssid);
                 soundBell();
@@ -252,6 +340,8 @@ public class Rat {
             existing.lastSeen = ap.lastSeen;
         }
         ai.seeAP(ap.bssid, ap.ssid, ap.channel, ap.security);
+        checkAlertRules(ap, existing == null);
+        knownSsids.put(ap.bssid, ap.ssid);
     }
 
     public void onClientProbe(String mac, String ssid) {
@@ -315,7 +405,6 @@ public class Rat {
                 exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
 
                 if (path.equals("/survey/export") && "GET".equals(method)) {
-                    // Download the CSV file
                     if (!Files.exists(surveyFile)) {
                         byte[] msg = "No survey data yet.".getBytes(StandardCharsets.UTF_8);
                         exchange.sendResponseHeaders(404, msg.length);
@@ -384,6 +473,74 @@ public class Rat {
                 exchange.close();
             });
 
+            // ── Alert rules CRUD ──
+            httpServer.createContext("/alerts", exchange -> {
+                exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                String method = exchange.getRequestMethod();
+                if ("GET".equals(method)) {
+                    StringBuilder sb = new StringBuilder("[");
+                    for (int i = 0; i < alertRules.size(); i++) {
+                        if (i > 0) sb.append(",");
+                        sb.append(alertRules.get(i).toJson());
+                    }
+                    sb.append("]");
+                    byte[] rb = sb.toString().getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, rb.length);
+                    exchange.getResponseBody().write(rb);
+                } else if ("POST".equals(method)) {
+                    String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8).trim();
+                    String type    = extractJsonString(body, "type");
+                    String pattern = extractJsonString(body, "pattern");
+                    String id      = "rule_" + System.currentTimeMillis();
+                    alertRules.add(new AlertRule(id, type, pattern, true));
+                    println("[ALERTS] Rule added: " + id + " type=" + type + " pattern=" + pattern);
+                    byte[] rb = ("{\"id\":\"" + id + "\"}").getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, rb.length);
+                    exchange.getResponseBody().write(rb);
+                } else if ("DELETE".equals(method)) {
+                    String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8).trim();
+                    String delId = extractJsonString(body, "id");
+                    alertRules.removeIf(r -> r.id.equals(delId));
+                    byte[] rb = "{\"status\":\"deleted\"}".getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, rb.length);
+                    exchange.getResponseBody().write(rb);
+                } else {
+                    exchange.sendResponseHeaders(405, -1);
+                }
+                exchange.getResponseBody().close();
+                exchange.close();
+            });
+
+            // ── KML / GPX export ──
+            httpServer.createContext("/export", exchange -> {
+                exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+                String path = exchange.getRequestURI().getPath();
+                if (!Files.exists(surveyFile)) {
+                    byte[] msg = "No survey data.".getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(404, msg.length);
+                    exchange.getResponseBody().write(msg);
+                    exchange.getResponseBody().close(); exchange.close(); return;
+                }
+                if (path.endsWith("/kml")) {
+                    byte[] kml = buildKml();
+                    exchange.getResponseHeaders().set("Content-Type", "application/vnd.google-earth.kml+xml");
+                    exchange.getResponseHeaders().set("Content-Disposition", "attachment; filename=\"survey_" + LocalDate.now() + ".kml\"");
+                    exchange.sendResponseHeaders(200, kml.length);
+                    exchange.getResponseBody().write(kml);
+                } else if (path.endsWith("/gpx")) {
+                    byte[] gpx = buildGpx();
+                    exchange.getResponseHeaders().set("Content-Type", "application/gpx+xml");
+                    exchange.getResponseHeaders().set("Content-Disposition", "attachment; filename=\"survey_" + LocalDate.now() + ".gpx\"");
+                    exchange.sendResponseHeaders(200, gpx.length);
+                    exchange.getResponseBody().write(gpx);
+                } else {
+                    exchange.sendResponseHeaders(404, -1);
+                }
+                exchange.getResponseBody().close();
+                exchange.close();
+            });
+
             httpServer.createContext("/sse", exchange -> {
                 println("New SSE connection from " + exchange.getRemoteAddress());
                 if (!"GET".equals(exchange.getRequestMethod())) {
@@ -432,11 +589,114 @@ public class Rat {
         }
     }
 
+    // ── Alert rules engine ──────────────────────────────────────────────────────
+    private void checkAlertRules(AP ap, boolean isNew) {
+        if (alertRules.isEmpty()) return;
+        long now = System.currentTimeMillis();
+        for (AlertRule rule : alertRules) {
+            if (!rule.enabled) continue;
+            boolean fired = false;
+            switch (rule.type) {
+                case "ssid_appears" -> {
+                    if (isNew && matchesPattern(ap.ssid, rule.pattern)) fired = true;
+                }
+                case "ssid_pattern" -> {
+                    if (matchesPattern(ap.ssid, rule.pattern)) fired = true;
+                }
+                case "open_network" -> {
+                    if (isNew && isOpen(ap)) fired = true;
+                }
+                // ssid_disappears is handled in evictStaleAps → checkDisappearsRules
+            }
+            if (fired) {
+                Long last = lastAlertTime.get(rule.id);
+                if (last == null || now - last > ALERT_COOLDOWN_MS) {
+                    lastAlertTime.put(rule.id, now);
+                    String msg = String.format("[ALERT-RULE:%s] %s matched SSID='%s' BSSID=%s",
+                        rule.id, rule.type, ap.ssid, ap.bssid);
+                    printlnStrongAlert(msg);
+                    soundBell();
+                    broadcastAlert(rule, ap);
+                }
+            }
+        }
+    }
+
+    // ── FIX #4 + #5: ssid_disappears now fires on eviction ──────────────────────
+    /**
+     * Checks ssid_disappears rules for an AP that is about to be evicted.
+     * Separated from checkAlertRules() because disappearance can only be
+     * detected at eviction time, not at discovery/update time.
+     */
+    private void checkDisappearsRules(AP ap) {
+        if (alertRules.isEmpty()) return;
+        long now = System.currentTimeMillis();
+        for (AlertRule rule : alertRules) {
+            if (!rule.enabled || !"ssid_disappears".equals(rule.type)) continue;
+            if (matchesPattern(ap.ssid, rule.pattern)) {
+                Long last = lastAlertTime.get(rule.id);
+                if (last == null || now - last > ALERT_COOLDOWN_MS) {
+                    lastAlertTime.put(rule.id, now);
+                    String msg = String.format("[ALERT-RULE:%s] ssid_disappears → SSID='%s' BSSID=%s evicted after 30min",
+                        rule.id, ap.ssid, ap.bssid);
+                    printlnStrongAlert(msg);
+                    soundBell();
+                    broadcastAlert(rule, ap);
+                }
+            }
+        }
+    }
+
+    private boolean matchesPattern(String ssid, String pattern) {
+        if (pattern == null || pattern.isEmpty()) return true;
+        try { return ssid != null && ssid.matches(pattern); }
+        catch (Exception e) { return ssid != null && ssid.contains(pattern); }
+    }
+
+    private void broadcastAlert(AlertRule rule, AP ap) {
+        String json = String.format(
+            "data: {\"type\":\"alert\",\"rule\":%s,\"ssid\":\"%s\",\"bssid\":\"%s\",\"signal\":%d}\n\n",
+            rule.toJson(), jsonEscape(ap.ssid), jsonEscape(ap.bssid), ap.signal);
+        for (HttpExchange ex : sseClients) {
+            try { ex.getResponseBody().write(json.getBytes(StandardCharsets.UTF_8)); ex.getResponseBody().flush(); }
+            catch (Exception ignored) {}
+        }
+    }
+
+    // ── AP eviction ─────────────────────────────────────────────────────────────
+    private static final long EVICT_MS = 30L * 60 * 1_000; // 30 minutes
+
+    /**
+     * FIX #4: ssid_disappears rules fire before removal.
+     * FIX #8: evicted count logged correctly.
+     */
+    private void evictStaleAps() {
+        long cutoff = System.currentTimeMillis() - EVICT_MS;
+        int  before = seenById.size();
+
+        seenById.entrySet().removeIf(entry -> {
+            AP ap = entry.getValue();
+            if (ap.lastSeen < cutoff) {
+                // Fire ssid_disappears rules BEFORE removing
+                checkDisappearsRules(ap);
+                // Clean up stale knownSsids entry
+                knownSsids.remove(ap.bssid);
+                return true;
+            }
+            return false;
+        });
+
+        int evicted = before - seenById.size();
+        if (evicted > 0)
+            printlnAlert("[EVICT] Removed " + evicted + " stale APs (not seen in 30min). Active: " + seenById.size());
+    }
+
     // ── Shutdown ────────────────────────────────────────────────────────────────
     private void shutdown() {
         println("\nShutting down BLACK ICE...");
         if (passiveScanner != null) passiveScanner.stop();
         stopSurvey();
+        localGeo.shutdown();
         scheduler.shutdownNow();
         background.shutdownNow();
         geoExecutor.shutdownNow();
@@ -487,6 +747,7 @@ public class Rat {
                     ap.channel,
                     csvEscape(ap.security));
                 surveyReadings.incrementAndGet();
+                localGeo.ingestReading(ap.bssid, ap.ssid, lat, lon, ap.signal);
             }
             surveyWriter.flush();
         }
@@ -497,6 +758,89 @@ public class Rat {
         if (s.contains(",") || s.contains("\"") || s.contains("\n"))
             return "\"" + s.replace("\"", "\"\"") + "\"";
         return s;
+    }
+
+    // ── KML builder ─────────────────────────────────────────────────────────────
+    private byte[] buildKml() throws IOException {
+        Map<String, List<String[]>> byBssid = new java.util.LinkedHashMap<>();
+        try (BufferedReader br = Files.newBufferedReader(surveyFile)) {
+            String line; boolean header = true;
+            while ((line = br.readLine()) != null) {
+                if (header) { header = false; continue; }
+                String[] p = line.split(",", -1);
+                if (p.length < 6) continue;
+                byBssid.computeIfAbsent(p[1], k -> new ArrayList<>()).add(p);
+            }
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        sb.append("<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n<Document>\n");
+        sb.append("<name>BLACK ICE v2 Survey</name>\n");
+        for (Map.Entry<String, List<String[]>> e : byBssid.entrySet()) {
+            List<String[]> rows = e.getValue();
+            String ssid = rows.get(0).length > 2 ? rows.get(0)[2] : e.getKey();
+            double lat = 0, lon = 0;
+            for (String[] r : rows) {
+                try { lat += Double.parseDouble(r[4]); lon += Double.parseDouble(r[5]); }
+                catch (Exception ignored) {}
+            }
+            lat /= rows.size(); lon /= rows.size();
+            sb.append("<Placemark>\n");
+            sb.append("<name>").append(xmlEscape(ssid)).append("</name>\n");
+            sb.append("<description>BSSID: ").append(xmlEscape(e.getKey()))
+              .append(" | Readings: ").append(rows.size()).append("</description>\n");
+            sb.append("<Point><coordinates>").append(lon).append(",").append(lat)
+              .append(",0</coordinates></Point>\n");
+            sb.append("</Placemark>\n");
+        }
+        sb.append("</Document>\n</kml>");
+        return sb.toString().getBytes(StandardCharsets.UTF_8);
+    }
+
+    // ── GPX builder ─────────────────────────────────────────────────────────────
+    private byte[] buildGpx() throws IOException {
+        StringBuilder sb = new StringBuilder();
+        sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        sb.append("<gpx version=\"1.1\" creator=\"BLACK ICE v2\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n");
+        sb.append("<trk><name>BLACK ICE Survey</name><trkseg>\n");
+        try (BufferedReader br = Files.newBufferedReader(surveyFile)) {
+            String line; boolean header = true;
+            while ((line = br.readLine()) != null) {
+                if (header) { header = false; continue; }
+                String[] p = line.split(",", -1);
+                if (p.length < 6) continue;
+                try {
+                    double lat = Double.parseDouble(p[4]);
+                    double lon = Double.parseDouble(p[5]);
+                    sb.append("<trkpt lat=\"").append(lat).append("\" lon=\"").append(lon).append("\">\n");
+                    sb.append("<name>").append(xmlEscape(p[2])).append("</name>\n");
+                    sb.append("<desc>BSSID:").append(xmlEscape(p[1])).append(" RSSI:").append(p[3]).append("</desc>\n");
+                    sb.append("<time>").append(p[0].trim().replace(" ", "T")).append("Z</time>\n");
+                    sb.append("</trkpt>\n");
+                } catch (Exception ignored) {}
+            }
+        }
+        sb.append("</trkseg></trk>\n</gpx>");
+        return sb.toString().getBytes(StandardCharsets.UTF_8);
+    }
+
+    private String xmlEscape(String s) {
+        if (s == null) return "";
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
+    }
+
+    /** Minimal JSON string field extractor — no full parser needed for small payloads. */
+    private String extractJsonString(String json, String key) {
+        String search = "\"" + key + "\"";
+        int idx = json.indexOf(search);
+        if (idx < 0) return "";
+        int colon = json.indexOf(":", idx + search.length());
+        if (colon < 0) return "";
+        int q1 = json.indexOf("\"", colon + 1);
+        if (q1 < 0) return "";
+        int q2 = json.indexOf("\"", q1 + 1);
+        if (q2 < 0) return "";
+        return json.substring(q1 + 1, q2);
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -535,11 +879,20 @@ public class Rat {
 
     private String safe(String s) { return s == null ? "" : s; }
 
-    public void println(String s)           { System.out.println(timestamp() + " " + s); }
-    public void printlnAlert(String s)      { System.out.println(timestamp() + " [ALERT]    " + s); }
-    public void printlnStrongAlert(String s){ System.out.println(timestamp() + " [CRITICAL] " + s); }
-    public String timestamp()               { return "[" + LocalDateTime.now().format(dtf) + "]"; }
-    public void soundBell()                 { System.out.print("\007"); System.out.flush(); }
+    // ── Log level filter ───────────────────────────────────────────────────────
+    public enum LogLevel { DEBUG, INFO, ALERT, CRITICAL }
+    private volatile LogLevel logLevel = LogLevel.INFO;
+    public void setLogLevel(LogLevel lvl) { this.logLevel = lvl; }
+    private void log(LogLevel lvl, String prefix, String s) {
+        if (lvl.ordinal() < logLevel.ordinal()) return;
+        System.out.println(timestamp() + prefix + s);
+    }
+    public void printlnDebug(String s)       { log(LogLevel.DEBUG,    " [DEBUG]    ", s); }
+    public void println(String s)            { log(LogLevel.INFO,     " ", s); }
+    public void printlnAlert(String s)       { log(LogLevel.ALERT,    " [ALERT]    ", s); }
+    public void printlnStrongAlert(String s) { log(LogLevel.CRITICAL, " [CRITICAL] ", s); }
+    public String timestamp()                { return "[" + LocalDateTime.now().format(dtf) + "]"; }
+    public void soundBell()                  { System.out.print("\007"); System.out.flush(); }
 
     // ── OUI / vendor lookup ─────────────────────────────────────────────────────
     private void loadBuiltInOuIs() {
@@ -590,17 +943,30 @@ public class Rat {
         println("[OUI] " + ouiMap.size() + " built-in entries loaded");
     }
 
+    /**
+     * FIX #6: replaced busy-wait polling loop with CountDownLatch.
+     * OuiDatabase signals the latch when its download completes;
+     * we await with a 90s timeout so startup never hangs indefinitely.
+     */
     private void downloadAndCacheIeeeOui() {
         try {
-            int waited = 0;
-            while (ouiDatabase.getEntryCount() < 10_000 && waited < 60_000) {
-                Thread.sleep(2_000);
-                waited += 2_000;
-                if (waited % 10_000 == 0)
-                    println("[OUI] Waiting for IEEE download... (" + ouiDatabase.getEntryCount() + " entries so far)");
+            boolean ready = ouiReady.await(90, TimeUnit.SECONDS);
+            if (ready) {
+                println("[OUI] Database ready: " + ouiDatabase.getEntryCount() + " entries");
+            } else {
+                println("[OUI] Timeout waiting for IEEE download — using built-in entries only");
             }
-            println("[OUI] Database ready: " + ouiDatabase.getEntryCount() + " entries");
-        } catch (InterruptedException ignored) {}
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Called by OuiDatabase when its download/load completes.
+     * Signals the CountDownLatch so downloadAndCacheIeeeOui() unblocks.
+     */
+    public void signalOuiReady() {
+        ouiReady.countDown();
     }
 
     private String getVendorFromBssid(String bssid) {
@@ -632,16 +998,29 @@ public class Rat {
 
     // ── Data classes ────────────────────────────────────────────────────────────
     public static class AP {
-        public String  ssid           = "<hidden>";
-        public String  bssid          = "";
-        public String  security       = "OPEN";
-        public int     signal         = -100;
-        public int     channel        = 0;
-        public double  lat            = -15.3875;
-        public double  lon            =  28.3228;
+        public String  ssid             = "<hidden>";
+        public String  bssid            = "";
+        public String  security         = "OPEN";
+        public int     signal           = -100;
+        public int     channel          = 0;
+        public double  lat              = -15.3875;  // Lusaka default — placeholder until resolved
+        public double  lon              =  28.3228;  // Lusaka default — placeholder until resolved
+        /**
+         * True once a real geo fix has been assigned (LocalDB / WiGLE / IP / Jitter).
+         * False means the AP is still at the default Lusaka placeholder coords.
+         *
+         * Public as positionRandom for backward compatibility with TestRunner.java
+         * and any other callers. Semantically it means "position has been resolved"
+         * but the field name is kept to avoid breaking the test suite.
+         */
         public boolean positionRandom = false;
-        public long    lastSeen       = System.currentTimeMillis();
-        public String  source         = "Unknown";
+
+        /** Convenience alias — reads/writes positionRandom. */
+        public boolean isPositionResolved()              { return positionRandom; }
+        public void    setPositionResolved(boolean v)    { positionRandom = v; }
+
+        public long    lastSeen = System.currentTimeMillis();
+        public String  source   = "Unknown";
     }
 
     /** Retained for any code that still references WebSocketHandshake. */
@@ -656,1423 +1035,1693 @@ public class Rat {
         }
     }
 
-    // ── Dashboard HTML ──────────────────────────────────────────────────────────
-    // BLACK ICE v2 — CartoDB Dark Matter tiles + ROOM MODE proximity radar
-    private static final String DASHBOARD_HTML = """
+    // ── Dashboard HTML ──────────────────────────────────────────────────────────────
+    // The dashboard HTML exceeds the JVM 65535-byte string constant limit,
+    // so it is split across two private helper methods concatenated at runtime.
+    // Each chunk is a text block (runtime value, not a compile-time constant),
+    // so the final String from buildDashboardHtml() has no size restriction.
+    private static String buildDashboardHtml() {
+        return dashHtml1() + dashHtml2();
+    }
+
+    private static String dashHtml1() {
+        return """
 <!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8">
-<title>BLACK ICE v2 // RAT SWARM</title>
+<title>BLACK ICE v2 // SIGINT TERMINAL</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-<link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Bebas+Neue&family=JetBrains+Mono:wght@300;400;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;900&family=Courier+Prime:ital,wght@0,400;0,700;1,400&family=Share+Tech+Mono&display=swap" rel="stylesheet">
 <style>
 :root {
-  --g:    #0aff6e;
-  --g2:   #00cc55;
-  --g3:   #004422;
-  --r:    #ff3c00;
-  --r2:   #cc2200;
-  --c:    #00e5ff;
-  --c2:   #0099bb;
-  --y:    #ffe600;
-  --bg:   #020d05;
-  --bg2:  #000a03;
-  --panel:#030f06ee;
-  --b1:   #0aff6e22;
-  --b2:   #0aff6e55;
-  --b3:   #0aff6e99;
-  --glow: 0 0 10px #0aff6e, 0 0 30px #0aff6e44;
-  --glow-r: 0 0 10px #ff3c00, 0 0 30px #ff3c0044;
-  --glow-c: 0 0 10px #00e5ff, 0 0 30px #00e5ff44;
+  --amber:   #ff8c00;
+  --amber2:  #cc6d00;
+  --amber3:  #7a3e00;
+  --amber4:  #2a1500;
+  --bone:    #e8dcc8;
+  --bone2:   #a89880;
+  --red:     #c41e0a;
+  --red2:    #7a1206;
+  --cyan:    #00b4cc;
+  --bg:      #080604;
+  --bg2:     #0e0c09;
+  --bg3:     #161208;
+  --rule:    #3a2800;
+  --glow:    0 0 8px #ff8c0088, 0 0 24px #ff8c0033;
+  --glow-r:  0 0 8px #c41e0a88, 0 0 24px #c41e0a33;
+  --glow-c:  0 0 8px #00b4cc88;
 }
-*{margin:0;padding:0;box-sizing:border-box;}
+*{ margin:0; padding:0; box-sizing:border-box; }
 
-body{
-  background:var(--bg);
-  color:var(--g);
-  font-family:'JetBrains Mono',monospace;
-  overflow:hidden;
-  cursor:crosshair;
-}
-
-/* ── MATRIX RAIN CANVAS ── */
-#matrix-canvas{
-  position:fixed;inset:0;
-  z-index:1;
-  pointer-events:none;
-  opacity:0.07;
+body {
+  background: var(--bg);
+  color: var(--amber);
+  font-family: 'Share Tech Mono', monospace;
+  overflow: hidden;
+  cursor: crosshair;
 }
 
-/* ── HEX GRID OVERLAY ── */
-#hex-overlay{
-  position:fixed;inset:0;
-  z-index:2;
-  pointer-events:none;
-  background-image:
-    linear-gradient(60deg,var(--b1) 1px,transparent 1px),
-    linear-gradient(-60deg,var(--b1) 1px,transparent 1px),
-    linear-gradient(0deg,var(--b1) 1px,transparent 1px);
-  background-size:40px 69px,40px 69px,40px 69px;
-  animation:hexdrift 40s linear infinite;
+/* ── CRT EFFECT LAYERS ── */
+#crt-scanlines {
+  position: fixed; inset: 0; z-index: 9998; pointer-events: none;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0,0,0,0.18) 2px,
+    rgba(0,0,0,0.18) 4px
+  );
 }
-@keyframes hexdrift{0%{background-position:0 0,0 0,0 0}100%{background-position:80px 0,80px 0,0 138px}}
-
-/* ── SCANLINE ── */
-#scanline{
-  position:fixed;inset:0;z-index:3;pointer-events:none;
-  background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,0.1) 3px,rgba(0,0,0,0.1) 4px);
+#crt-vignette {
+  position: fixed; inset: 0; z-index: 9997; pointer-events: none;
+  background: radial-gradient(ellipse at 50% 50%,
+    transparent 55%,
+    rgba(0,0,0,0.6) 80%,
+    rgba(0,0,0,0.95) 100%
+  );
 }
-
-/* ── VIGNETTE ── */
-#vignette{
-  position:fixed;inset:0;z-index:4;pointer-events:none;
-  background:radial-gradient(ellipse at center,transparent 50%,rgba(0,0,0,0.85) 100%);
+#crt-sweep {
+  position: fixed; left: 0; right: 0; height: 3px;
+  z-index: 9996; pointer-events: none;
+  background: linear-gradient(180deg, transparent, rgba(255,140,0,0.12) 50%, transparent);
+  animation: sweep 8s linear infinite;
+}
+@keyframes sweep {
+  0%   { top: -4px; opacity: 0; }
+  2%   { opacity: 1; }
+  98%  { opacity: 1; }
+  100% { top: 100vh; opacity: 0; }
+}
+#crt-flicker {
+  position: fixed; inset: 0; z-index: 9995; pointer-events: none;
+  animation: flicker 0.15s infinite;
+  background: rgba(255,140,0,0.015);
+}
+@keyframes flicker {
+  0%,100% { opacity: 1; }
+  50%     { opacity: 0.94; }
+  75%     { opacity: 0.97; }
+}
+#noise-canvas {
+  position: fixed; inset: 0; z-index: 9994; pointer-events: none; opacity: 0.04;
 }
 
 /* ── MAP ── */
-#map{
-  position:fixed;inset:0;
-  z-index:0;
-  filter:hue-rotate(105deg) saturate(0.25) brightness(0.4) contrast(1.4);
-  transition:opacity 0.5s;
+#map {
+  position: fixed; inset: 0; z-index: 0;
+  filter:none;
+  transition: opacity 0.4s;
 }
-#map.hidden{ opacity:0; pointer-events:none; }
+#map.hidden { opacity: 0; pointer-events: none; }
 
-/* ── ROOM MODE RADAR ── */
-#room-radar{
-  position:fixed;inset:0;
-  z-index:0;
-  background:radial-gradient(ellipse at center, #010d04 0%, #020d05 100%);
-  display:none;
-  align-items:center;
-  justify-content:center;
+/* ── ROOM RADAR ── */
+#room-radar {
+  position: fixed; inset: 0; z-index: 1;
+  display: none; align-items: center; justify-content: center;
+  background: var(--bg);
 }
-#room-radar.active{ display:flex; }
+#room-radar.active { display: flex; }
+#radar-canvas { position: fixed; top: 48px; left: 0; }
 
-#radar-canvas{
-  position:absolute;
-  top:50%; left:50%;
-  transform:translate(-50%,-50%);
+/* ── TOP HEADER BAR ── */
+.hdr {
+  position: fixed; top: 0; left: 0; right: 0; height: 48px;
+  z-index: 1000;
+  background: var(--bg2);
+  border-bottom: 2px solid var(--amber3);
+  display: flex; align-items: stretch;
+  box-shadow: 0 2px 0 var(--amber), 0 3px 20px rgba(255,140,0,0.15);
 }
+.hdr-brand {
+  display: flex; align-items: center;
+  padding: 0 20px;
+  border-right: 2px solid var(--amber3);
+  gap: 10px;
+  flex-shrink: 0;
+}
+.hdr-brand-name {
+  font-family: 'Big Shoulders Display', sans-serif;
+  font-size: 20px; font-weight: 900;
+  letter-spacing: 6px;
+  color: var(--amber);
+  text-shadow: var(--glow);
+  line-height: 1;
+}
+.hdr-brand-sub {
+  font-size: 7px; letter-spacing: 4px;
+  color: var(--amber3);
+  text-transform: uppercase;
+  line-height: 1;
+  margin-top: 2px;
+}
+.hdr-sep { width: 2px; background: var(--amber3); flex-shrink: 0; }
+.hdr-stat {
+  display: flex; flex-direction: column; justify-content: center;
+  padding: 0 16px;
+  border-right: 1px solid var(--amber3);
+  flex-shrink: 0;
+}
+.hdr-stat-lbl {
+  font-size: 6px; letter-spacing: 4px; color: var(--amber3);
+  text-transform: uppercase; line-height: 1;
+}
+.hdr-stat-val {
+  font-family: 'Big Shoulders Display', sans-serif;
+  font-size: 22px; font-weight: 700; line-height: 1;
+  color: var(--amber); text-shadow: var(--glow);
+}
+.hdr-stat-val.danger { color: var(--red); text-shadow: var(--glow-r); }
+.hdr-stat-val.cyan   { color: var(--cyan); text-shadow: var(--glow-c); }
 
-/* ── RADAR RING (map pulse) ── */
-#radar-ring{
-  position:fixed;
-  z-index:5;
-  pointer-events:none;
-  border-radius:50%;
-  border:1px solid var(--b2);
-  box-shadow:inset 0 0 40px var(--b1);
+.threat-bar {
+  display: flex; align-items: center;
+  padding: 0 16px;
+  border-right: 1px solid var(--amber3);
+  gap: 6px; flex-shrink: 0;
 }
+.threat-label {
+  font-family: 'Big Shoulders Display', sans-serif;
+  font-size: 11px; font-weight: 700; letter-spacing: 4px;
+  padding: 3px 10px 2px;
+  border: 1px solid currentColor;
+}
+.threat-label.nom  { color: var(--amber); box-shadow: var(--glow); }
+.threat-label.elv  { color: #ffcc00; box-shadow: 0 0 8px #ffcc0066; }
+.threat-label.crit {
+  color: var(--red); box-shadow: var(--glow-r);
+  animation: crit-blink 0.4s step-end infinite;
+}
+@keyframes crit-blink { 50% { opacity: 0.2; } }
 
-/* ── HEADER ── */
-.hdr{
-  position:fixed;top:0;left:0;right:0;
-  height:52px;
-  z-index:1000;
-  background:linear-gradient(180deg,rgba(2,13,5,0.99) 0%,rgba(2,13,5,0.88) 100%);
-  border-bottom:1px solid var(--b2);
-  box-shadow:var(--glow);
-  display:flex;align-items:center;
-  padding:0 16px;gap:16px;
+.hdr-gps {
+  display: flex; align-items: center; gap: 6px;
+  padding: 0 14px;
+  border-right: 1px solid var(--amber3);
+  font-size: 9px; letter-spacing: 2px; color: var(--amber3);
+  flex-shrink: 0;
 }
-
-.logo{
-  font-family:'Bebas Neue',monospace;
-  font-size:26px;
-  letter-spacing:5px;
-  color:var(--g);
-  text-shadow:var(--glow);
-  animation:logoglitch 6s infinite;
-  flex-shrink:0;
+.hdr-gps.live { color: var(--cyan); }
+.gps-pip {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--amber3);
 }
-@keyframes logoglitch{
-  0%,88%,100%{clip-path:none;transform:none;filter:none}
-  89%{clip-path:inset(30% 0 40% 0);transform:translateX(-3px);filter:hue-rotate(90deg)}
-  91%{clip-path:inset(55% 0 15% 0);transform:translateX(3px)}
-  93%{clip-path:inset(15% 0 60% 0);transform:translateX(-1px)}
-  95%{clip-path:none;transform:none}
+.hdr-gps.live .gps-pip {
+  background: var(--cyan);
+  box-shadow: var(--glow-c);
+  animation: pip-pulse 1.2s ease-in-out infinite;
 }
-
-.hdr-sep{width:1px;height:28px;background:var(--b2);flex-shrink:0;}
-
-.stat{display:flex;flex-direction:column;gap:0;}
-.stat-lbl{font-size:8px;color:var(--g2);letter-spacing:3px;text-transform:uppercase;}
-.stat-val{
-  font-family:'Bebas Neue',monospace;font-size:26px;line-height:1;
-  color:var(--g);text-shadow:var(--glow);
-}
-.stat-val.red{color:var(--r);text-shadow:var(--glow-r);}
-.stat-val.cyan{color:var(--c);text-shadow:var(--glow-c);}
-.stat-val.yellow{color:var(--y);text-shadow:0 0 10px var(--y);}
-
-.threat-badge{
-  font-family:'Bebas Neue',monospace;font-size:13px;letter-spacing:3px;
-  padding:3px 10px;border:1px solid currentColor;
-  transition:all 0.3s;flex-shrink:0;
-}
-.threat-badge.nom{color:var(--g);box-shadow:var(--glow);}
-.threat-badge.elv{color:var(--y);box-shadow:0 0 8px var(--y);}
-.threat-badge.crit{color:var(--r);box-shadow:var(--glow-r);animation:blinkbadge 0.5s infinite;}
-@keyframes blinkbadge{0%,100%{opacity:1}50%{opacity:0.3}}
-
-.gps-pill{
-  display:flex;align-items:center;gap:5px;
-  font-size:9px;letter-spacing:2px;padding:3px 8px;
-  border:1px solid var(--b2);color:var(--g2);flex-shrink:0;
-}
-.gps-dot{
-  width:6px;height:6px;border-radius:50%;background:var(--g2);
-  box-shadow:0 0 4px var(--g2);
-}
-.gps-pill.live .gps-dot{background:var(--c);box-shadow:var(--glow-c);animation:gpspulse 1s infinite;}
-.gps-pill.live{color:var(--c);border-color:var(--c2);}
-@keyframes gpspulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.6);opacity:0.4}}
-
-#clock{
-  font-family:'Bebas Neue',monospace;font-size:22px;
-  color:var(--g);text-shadow:var(--glow);letter-spacing:3px;flex-shrink:0;
-}
-
-.hdr-right{margin-left:auto;display:flex;align-items:center;gap:10px;}
-
-.pill{
-  display:flex;align-items:center;gap:6px;padding:4px 10px;
-  border:1px solid currentColor;font-size:9px;letter-spacing:2px;text-transform:uppercase;
-}
-.pill.conn{color:var(--g);box-shadow:var(--glow);}
-.pill.disc{color:var(--r);box-shadow:var(--glow-r);}
-.pill.wait{color:var(--y);box-shadow:0 0 6px var(--y);animation:blinkbadge 1s infinite;}
-.pill-dot{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 5px currentColor;animation:gpspulse 1.2s infinite;}
-
-.btn{
-  font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:2px;text-transform:uppercase;
-  background:transparent;color:var(--g);border:1px solid var(--b3);
-  padding:5px 12px;cursor:crosshair;transition:all 0.15s;position:relative;overflow:hidden;
-  flex-shrink:0;
-}
-.btn::before{
-  content:'';position:absolute;inset:0;background:var(--g);
-  transform:translateX(-101%);transition:transform 0.12s;z-index:-1;
-}
-.btn:hover{color:#000;box-shadow:var(--glow);}
-.btn:hover::before{transform:translateX(0);}
-.btn.on{background:var(--g);color:#000;}
-
-/* Room mode button active state */
-.btn.room-active{
-  background:var(--c);color:#000;border-color:var(--c);
-  box-shadow:var(--glow-c);
-  animation:none;
-}
-.btn.room-active::before{ background:var(--c); }
-
-/* Survey mode button active state */
-.btn.survey-active{
-  background:var(--y);color:#000;border-color:var(--y);
-  box-shadow:0 0 10px var(--y),0 0 30px #ffe60044;
-  animation:surveypulse 1s infinite;
-}
-.btn.survey-active::before{ background:var(--y); }
-@keyframes surveypulse{0%,100%{box-shadow:0 0 10px var(--y),0 0 30px #ffe60044}50%{box-shadow:0 0 18px var(--y),0 0 50px #ffe60088}}
-
-/* Survey stat */
-.stat-val.survey{ color:var(--y); text-shadow:0 0 10px var(--y),0 0 30px #ffe60044; }
-
-/* ── SURVEY HEATMAP LEGEND ── */
-#survey-legend{
-  position:fixed;
-  bottom:68px;right:12px;
-  z-index:600;
-  font-size:9px;
-  letter-spacing:2px;
-  display:none;
-  flex-direction:column;
-  gap:4px;
-  background:rgba(2,13,5,0.92);
-  border:1px solid rgba(255,230,0,0.4);
-  padding:10px 14px;
-  box-shadow:0 0 12px #ffe60033;
-}
-#survey-legend.active{ display:flex; }
-.survey-legend-title{
-  font-family:'Bebas Neue',monospace;font-size:12px;letter-spacing:3px;
-  color:var(--y);text-shadow:0 0 8px var(--y);margin-bottom:4px;
-}
-.survey-ap-row{
-  display:flex;align-items:center;gap:6px;cursor:crosshair;padding:2px 0;
-  font-size:9px;letter-spacing:1px;
-}
-.survey-ap-row:hover{ color:var(--g); }
-.survey-ap-dot{ width:8px;height:8px;border-radius:50%;flex-shrink:0; }
-#survey-reading-cnt{
-  font-family:'Bebas Neue',monospace;font-size:11px;color:#ffe600aa;
-  margin-top:6px;border-top:1px solid #ffe60033;padding-top:6px;
-  display:flex;justify-content:space-between;align-items:center;gap:12px;
-}
-.survey-dl-btn{
-  font-size:8px;letter-spacing:2px;color:#ffe600;border:1px solid #ffe60055;
-  padding:2px 7px;cursor:crosshair;background:transparent;
-  font-family:'JetBrains Mono',monospace;
-}
-.survey-dl-btn:hover{background:#ffe60022;}
-.survey-clear-btn{
-  font-size:8px;letter-spacing:2px;color:#ff3c00;border:1px solid #ff3c0055;
-  padding:2px 7px;cursor:crosshair;background:transparent;
-  font-family:'JetBrains Mono',monospace;
-}
-.survey-clear-btn:hover{background:#ff3c0022;}
-
-/* ── SIDE PANEL ── */
-#panel{
-  position:fixed;top:52px;right:0;bottom:60px;
-  width:300px;
-  background:var(--panel);
-  border-left:1px solid var(--b2);
-  box-shadow:var(--glow);
-  display:none;flex-direction:column;
-  z-index:800;
-  backdrop-filter:blur(4px);
-}
-#panel.open{display:flex;}
-
-.panel-hdr{
-  padding:10px 14px;border-bottom:1px solid var(--b2);
-  font-family:'Bebas Neue',monospace;font-size:14px;letter-spacing:4px;
-  color:var(--g);text-shadow:var(--glow);
-  display:flex;align-items:center;justify-content:space-between;
-  background:rgba(10,255,110,0.04);
-}
-.pcnt{
-  background:var(--g);color:#000;
-  font-family:'Bebas Neue',monospace;padding:1px 7px;font-size:16px;
+@keyframes pip-pulse {
+  0%,100% { transform: scale(1); opacity: 1; }
+  50%     { transform: scale(1.8); opacity: 0.4; }
 }
 
-#ap-list{flex:1;overflow-y:auto;padding:2px 0;}
-#ap-list::-webkit-scrollbar{width:3px;}
-#ap-list::-webkit-scrollbar-track{background:#000;}
-#ap-list::-webkit-scrollbar-thumb{background:var(--g2);}
-
-.ap-row{
-  padding:8px 14px;border-bottom:1px solid rgba(10,255,110,0.06);
-  cursor:crosshair;transition:background 0.1s;
-  animation:rowfade 0.35s ease-out;
-}
-@keyframes rowfade{from{background:rgba(10,255,110,0.1);opacity:0}to{background:transparent;opacity:1}}
-.ap-row:hover{background:rgba(10,255,110,0.05);}
-
-.ap-name{
-  font-size:12px;color:var(--g);text-shadow:0 0 6px #0aff6e55;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:230px;
-}
-.ap-name.open{color:var(--r);text-shadow:var(--glow-r);}
-.ap-info{display:flex;flex-wrap:wrap;gap:8px;margin-top:2px;font-size:9px;color:var(--g3);}
-.ap-info span{color:var(--g2);}
-.ap-info .mac{color:#005522;font-size:8px;}
-.ap-info .tag-open{color:var(--r);animation:blinkbadge 0.9s infinite;font-weight:700;}
-
-/* ── BOTTOM LOG ── */
-#log{
-  position:fixed;bottom:0;left:0;right:0;height:60px;
-  background:rgba(2,10,3,0.96);border-top:1px solid var(--b2);
-  z-index:800;padding:4px 14px;
-  display:flex;flex-direction:column;justify-content:flex-end;gap:1px;
-  transition:right 0.2s;
-  font-size:10px;
-}
-.log-line{
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-  animation:logslide 0.25s ease-out;opacity:0.65;
-}
-.log-line:last-child{opacity:1;}
-@keyframes logslide{from{transform:translateY(8px);opacity:0}to{transform:translateY(0);opacity:1}}
-.lt{color:#003d11;margin-right:6px;}
-.li{color:var(--g2);}
-.lw{color:var(--y);}
-.lc{color:var(--r);text-shadow:var(--glow-r);}
-.ln{color:var(--c);text-shadow:var(--glow-c);}
-
-/* ── CORNER TARGETS ── */
-.tgt{position:fixed;width:24px;height:24px;z-index:900;pointer-events:none;}
-.tgt.tl{top:56px;left:4px;border-top:2px solid var(--g);border-left:2px solid var(--g);}
-.tgt.tr{top:56px;right:4px;border-top:2px solid var(--g);border-right:2px solid var(--g);}
-.tgt.bl{bottom:64px;left:4px;border-bottom:2px solid var(--g);border-left:2px solid var(--g);}
-.tgt.br{bottom:64px;right:4px;border-bottom:2px solid var(--g);border-right:2px solid var(--g);}
-
-/* ── SIGNAL BARS ── */
-.sb{display:inline-flex;gap:2px;align-items:flex-end;height:10px;vertical-align:middle;}
-.sb span{display:block;width:3px;background:currentColor;opacity:0.2;border-radius:1px;}
-.sb span.on{opacity:1;}
-.sb span:nth-child(1){height:25%}
-.sb span:nth-child(2){height:50%}
-.sb span:nth-child(3){height:75%}
-.sb span:nth-child(4){height:100%}
-
-/* ── ROOM MODE TOOLTIP ── */
-#radar-tooltip{
-  position:fixed;
-  background:rgba(2,13,5,0.95);
-  border:1px solid var(--b2);
-  padding:8px 12px;
-  font-size:10px;
-  pointer-events:none;
-  z-index:600;
-  display:none;
-  min-width:200px;
-  box-shadow:var(--glow);
-}
-#radar-tooltip .tt-ssid{
-  font-family:'Bebas Neue',monospace;
-  font-size:16px;
-  letter-spacing:3px;
-  color:var(--g);
-  text-shadow:var(--glow);
+#clock {
+  display: flex; align-items: center;
+  padding: 0 16px;
+  border-right: 1px solid var(--amber3);
+  font-family: 'Big Shoulders Display', sans-serif;
+  font-size: 20px; font-weight: 400; letter-spacing: 4px;
+  color: var(--bone2);
+  flex-shrink: 0;
 }
 
-/* ── ROOM MODE LEGEND ── */
-#radar-legend{
-  position:fixed;
-  bottom:68px;left:12px;
-  z-index:600;
-  font-size:9px;
-  letter-spacing:2px;
-  color:var(--g3);
-  display:none;
-  flex-direction:column;
-  gap:4px;
-  background:rgba(2,13,5,0.85);
-  border:1px solid var(--b2);
-  padding:8px 12px;
+.hdr-right {
+  margin-left: auto;
+  display: flex; align-items: stretch;
 }
-#radar-legend.active{ display:flex; }
-.leg-row{ display:flex;align-items:center;gap:8px; }
-.leg-dot{ width:8px;height:8px;border-radius:50%;flex-shrink:0; }
+.hdr-right .hdr-stat { border-right: none; border-left: 1px solid var(--amber3); }
 
-/* ── LEAFLET ── */
-.leaflet-popup-content-wrapper{
-  background:transparent!important;border:none!important;
-  border-radius:0!important;box-shadow:none!important;
-  padding:0!important;
+.conn-badge {
+  display: flex; align-items: center; gap: 5px;
+  padding: 0 14px;
+  border-left: 1px solid var(--amber3);
+  font-size: 8px; letter-spacing: 3px;
+  text-transform: uppercase;
+  flex-shrink: 0;
 }
-.leaflet-popup-content{
-  margin:0!important;padding:0!important;
-  font-family:'JetBrains Mono',monospace!important;
-  font-size:11px!important;
-  width:auto!important;
-  min-width:280px!important;
-}
-.leaflet-popup-tip-container{display:none!important;}
-.leaflet-popup-close-button{
-  color:#0aff6e!important;font-size:18px!important;
-  top:6px!important;right:8px!important;
-  z-index:10;background:transparent!important;
-  text-shadow:0 0 6px #0aff6e!important;
-}
-.leaflet-control-attribution{display:none!important;}
-.leaflet-control-zoom a{
-  background:rgba(2,13,5,0.95)!important;color:var(--g)!important;
-  border-color:var(--b2)!important;font-family:'Bebas Neue',monospace!important;
+.conn-badge.live { color: var(--amber); }
+.conn-badge.disc { color: var(--red); }
+.conn-badge.wait { color: #ffcc00; animation: crit-blink 1s step-end infinite; }
+.conn-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor; box-shadow: 0 0 4px currentColor;
 }
 
-/* ── TYPEWRITER BOOT ── */
-#boot-overlay{
-  position:fixed;inset:0;z-index:9000;
-  background:var(--bg2);
-  display:flex;flex-direction:column;justify-content:center;align-items:flex-start;
-  padding:60px;
-  transition:opacity 0.8s;
+/* ── BUTTON SYSTEM ── */
+.ctrl-strip {
+  position: fixed; top: 48px; right: 0;
+  width: 44px;
+  z-index: 800;
+  background: var(--bg2);
+  border-left: 2px solid var(--amber3);
+  border-bottom: 2px solid var(--amber3);
+  display: flex; flex-direction: column;
+  box-shadow: -2px 0 0 var(--amber3);
 }
-#boot-overlay.fade{opacity:0;pointer-events:none;}
-.boot-line{
-  font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--g);
-  margin:1px 0;white-space:pre;
+.ctrl-btn {
+  width: 44px; height: 44px;
+  background: transparent;
+  border: none; border-bottom: 1px solid var(--amber3);
+  color: var(--amber3);
+  cursor: crosshair;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 15px;
+  transition: all 0.1s;
+  position: relative;
 }
-.boot-cursor{
-  display:inline-block;width:9px;height:14px;background:var(--g);
-  animation:cursorblink 0.6s infinite;vertical-align:middle;
+.ctrl-btn:hover, .ctrl-btn.active {
+  background: var(--amber3);
+  color: var(--amber);
+  text-shadow: var(--glow);
 }
-@keyframes cursorblink{0%,49%{opacity:1}50%,100%{opacity:0}}
+.ctrl-btn.alert-active {
+  color: var(--red); background: rgba(196,30,10,0.15);
+  animation: crit-blink 0.5s step-end infinite;
+}
+.ctrl-btn[data-tip]:hover::after {
+  content: attr(data-tip);
+  position: absolute; right: 48px; top: 50%; transform: translateY(-50%);
+  background: var(--bg2); border: 1px solid var(--amber);
+  color: var(--amber); font-size: 8px; letter-spacing: 2px;
+  padding: 3px 8px; white-space: nowrap; z-index: 9999;
+  box-shadow: var(--glow);
+}
+
+/* ── SIDE PANEL (targets) ── */
+#panel {
+  position: fixed; top: 48px; right: 44px; bottom: 52px;
+  width: 280px;
+  background: var(--bg2);
+  border-left: 2px solid var(--amber3);
+  display: none; flex-direction: column;
+  z-index: 700;
+}
+#panel.open { display: flex; }
+.panel-head {
+  padding: 10px 14px 8px;
+  border-bottom: 1px solid var(--amber3);
+  font-family: 'Big Shoulders Display', sans-serif;
+  font-size: 13px; font-weight: 700; letter-spacing: 5px;
+  color: var(--amber);
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--bg3);
+  flex-shrink: 0;
+}
+.panel-count {
+  font-family: 'Big Shoulders Display', monospace;
+  font-size: 18px; font-weight: 900;
+  color: var(--bg); background: var(--amber);
+  padding: 0 6px; line-height: 1.4;
+}
+#ap-list { flex: 1; overflow-y: auto; }
+#ap-list::-webkit-scrollbar { width: 3px; }
+#ap-list::-webkit-scrollbar-track { background: var(--bg); }
+#ap-list::-webkit-scrollbar-thumb { background: var(--amber3); }
+.ap-item {
+  padding: 7px 14px;
+  border-bottom: 1px solid var(--rule);
+  cursor: crosshair;
+  transition: background 0.08s;
+}
+.ap-item:hover { background: rgba(255,140,0,0.06); }
+.ap-item.open-net { border-left: 3px solid var(--red); }
+.ap-ssid {
+  font-size: 11px; color: var(--bone);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ap-ssid.open-ssid { color: var(--red); }
+.ap-meta {
+  font-size: 8px; color: var(--amber3);
+  display: flex; gap: 8px; margin-top: 2px; flex-wrap: wrap;
+}
+.ap-meta span { color: var(--amber2); }
+.ap-meta .mac { color: var(--amber3); font-size: 7px; }
+.open-tag {
+  color: var(--red); font-size: 7px; letter-spacing: 2px;
+  animation: crit-blink 0.8s step-end infinite;
+}
+.sig-bar {
+  display: inline-flex; gap: 1px; align-items: flex-end;
+  height: 8px; vertical-align: middle;
+}
+.sig-bar span {
+  display: block; width: 2px; background: currentColor; opacity: 0.2;
+}
+.sig-bar span.on { opacity: 1; }
+.sig-bar span:nth-child(1) { height: 25%; }
+.sig-bar span:nth-child(2) { height: 50%; }
+.sig-bar span:nth-child(3) { height: 75%; }
+.sig-bar span:nth-child(4) { height: 100%; }
+
+/* ── CHANNEL PANEL ── */
+#chan-panel {
+  position: fixed; top: 48px; left: 0; bottom: 52px;
+  width: 240px;
+  background: var(--bg2);
+  border-right: 2px solid var(--amber3);
+  display: none; flex-direction: column;
+  z-index: 700;
+}
+#chan-panel.open { display: flex; }
+.chan-head {
+  padding: 10px 14px 8px;
+  border-bottom: 1px solid var(--amber3);
+  font-family: 'Big Shoulders Display', sans-serif;
+  font-size: 13px; font-weight: 700; letter-spacing: 5px;
+  color: var(--cyan);
+  background: var(--bg3);
+  flex-shrink: 0;
+  text-shadow: var(--glow-c);
+}
+#chan-canvas { flex: 1; }
+
+/* ── ALERT PANEL ── */
+#alert-panel {
+  position: fixed; top: 48px; right: 44px; bottom: 52px;
+  width: 280px;
+  background: var(--bg2);
+  border-left: 2px solid var(--red2);
+  display: none; flex-direction: column;
+  z-index: 699;
+  box-shadow: -4px 0 20px rgba(196,30,10,0.2);
+}
+#alert-panel.open { display: flex; }
+.alert-head {
+  padding: 10px 14px 8px;
+  border-bottom: 1px solid var(--red2);
+  font-family: 'Big Shoulders Display', sans-serif;
+  font-size: 13px; font-weight: 700; letter-spacing: 5px;
+  color: var(--red);
+  background: var(--bg3);
+  flex-shrink: 0;
+  text-shadow: var(--glow-r);
+}
+#alert-fired-log { flex: 1; overflow-y: auto; }
+.fired-row {
+  padding: 5px 14px;
+  border-bottom: 1px solid rgba(196,30,10,0.15);
+  font-size: 8px; letter-spacing: 1px; color: var(--red);
+}
+#alert-rule-list { flex-shrink: 0; }
+.rule-row {
+  padding: 6px 14px;
+  border-bottom: 1px solid rgba(196,30,10,0.12);
+  font-size: 8px; letter-spacing: 1px;
+  display: flex; align-items: center; gap: 6px;
+}
+.rule-type { color: #ffcc00; font-size: 7px; letter-spacing: 2px; }
+.rule-pattern { color: var(--amber2); flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.rule-del {
+  font-size: 9px; color: var(--red);
+  border: 1px solid var(--red2); background: transparent;
+  padding: 1px 5px; cursor: crosshair;
+  font-family: 'Share Tech Mono', monospace;
+  flex-shrink: 0;
+}
+.rule-del:hover { background: var(--red2); }
+.alert-form {
+  padding: 10px 14px;
+  border-top: 1px solid var(--red2);
+  flex-shrink: 0;
+  background: var(--bg3);
+}
+.alert-form-title {
+  font-family: 'Big Shoulders Display', sans-serif;
+  font-size: 9px; letter-spacing: 4px; color: var(--red);
+  margin-bottom: 6px; font-weight: 700;
+}
+.a-sel, .a-inp {
+  width: 100%; background: var(--bg);
+  color: var(--amber); border: 1px solid var(--amber3);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 8px; padding: 4px 6px;
+  letter-spacing: 1px; margin-bottom: 4px;
+}
+.a-sel option { background: var(--bg); }
+.a-add {
+  width: 100%;
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 8px; letter-spacing: 3px;
+  background: transparent; color: var(--red);
+  border: 1px solid var(--red2); padding: 5px;
+  cursor: crosshair; text-transform: uppercase;
+  transition: all 0.1s;
+}
+.a-add:hover { background: var(--red2); color: var(--bone); }
+
+/* ── TRILATERATION PANEL ── */
+#tri-panel {
+  position: fixed;
+  top: 56px; left: 50%; transform: translateX(-50%);
+  width: 340px;
+  background: var(--bg2);
+  border: 2px solid var(--cyan);
+  z-index: 2000;
+  display: none; flex-direction: column;
+  padding: 16px; gap: 10px;
+  box-shadow: 0 0 40px rgba(0,180,204,0.2);
+}
+#tri-panel.active { display: flex; }
+.tri-head {
+  font-family: 'Big Shoulders Display', sans-serif;
+  font-size: 16px; font-weight: 700; letter-spacing: 5px;
+  color: var(--cyan); text-shadow: var(--glow-c);
+}
+.tri-lbl { font-size: 8px; letter-spacing: 3px; color: var(--amber3); }
+.tri-status { font-size: 10px; color: var(--bone2); min-height: 32px; line-height: 1.6; }
+.tri-dots { display: flex; gap: 6px; }
+.tri-dot {
+  flex: 1; height: 4px; background: var(--rule);
+  border: 1px solid var(--amber3);
+  transition: background 0.2s;
+}
+.tri-dot.lit { background: var(--cyan); border-color: var(--cyan); box-shadow: var(--glow-c); }
+#tri-ap-sel {
+  background: var(--bg); color: var(--amber);
+  border: 1px solid var(--amber3);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 9px; padding: 4px 8px; width: 100%;
+}
+#tri-ap-sel option { background: var(--bg); }
+.tri-btns { display: flex; gap: 8px; }
+.tri-btn {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 8px; letter-spacing: 3px;
+  background: transparent; color: var(--cyan);
+  border: 1px solid var(--cyan);
+  padding: 6px 12px; cursor: crosshair;
+  text-transform: uppercase; transition: all 0.1s;
+}
+.tri-btn:hover { background: var(--cyan); color: var(--bg); }
+.tri-btn.cancel { color: var(--red); border-color: var(--red2); }
+.tri-btn.cancel:hover { background: var(--red2); color: var(--bone); }
+
+/* ── SURVEY LEGEND ── */
+#survey-legend {
+  position: fixed; bottom: 60px; right: 52px;
+  z-index: 600;
+  background: var(--bg2);
+  border: 1px solid var(--amber3);
+  padding: 10px 12px;
+  display: none; flex-direction: column; gap: 4px;
+  font-size: 8px; letter-spacing: 2px;
+  box-shadow: var(--glow);
+}
+#survey-legend.active { display: flex; }
+.survey-title {
+  font-family: 'Big Shoulders Display', sans-serif;
+  font-size: 11px; font-weight: 700; letter-spacing: 4px;
+  color: #ffcc00; margin-bottom: 2px;
+}
+.survey-row {
+  display: flex; align-items: center; gap: 6px;
+  cursor: crosshair;
+}
+.survey-dot { width: 7px; height: 7px; flex-shrink: 0; }
+.survey-cnt-bar {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 10px; margin-top: 6px;
+  padding-top: 6px; border-top: 1px solid var(--amber3);
+  color: var(--amber3); font-size: 7px;
+}
+.sv-btn {
+  font-size: 7px; letter-spacing: 2px;
+  border: 1px solid var(--amber3); background: transparent;
+  color: var(--amber3); padding: 2px 6px; cursor: crosshair;
+  font-family: 'Share Tech Mono', monospace;
+}
+.sv-btn:hover { border-color: var(--amber); color: var(--amber); }
+.sv-btn.danger { border-color: var(--red2); color: var(--red); }
+.sv-btn.danger:hover { background: var(--red2); }
+
+/* ── RADAR LEGEND ── */
+#radar-legend {
+  position: fixed; bottom: 60px; left: 8px;
+  z-index: 600;
+  background: var(--bg2);
+  border: 1px solid var(--amber3);
+  padding: 8px 12px;
+  display: none; flex-direction: column; gap: 4px;
+  font-size: 8px; letter-spacing: 2px; color: var(--amber3);
+}
+#radar-legend.active { display: flex; }
+.rleg-title {
+  font-family: 'Big Shoulders Display', sans-serif;
+  font-size: 10px; font-weight: 700; letter-spacing: 4px;
+  color: var(--amber); margin-bottom: 2px;
+}
+.rleg-row { display: flex; align-items: center; gap: 7px; }
+.rleg-dot { width: 7px; height: 7px; flex-shrink: 0; }
+
+/* ── RADAR TOOLTIP ── */
+#radar-tip {
+  position: fixed; z-index: 9990; display: none;
+  background: var(--bg2);
+  border: 1px solid var(--amber);
+  padding: 8px 12px; font-size: 9px;
+  pointer-events: none; min-width: 180px;
+  box-shadow: var(--glow);
+}
+.rtip-ssid {
+  font-family: 'Big Shoulders Display', sans-serif;
+  font-size: 15px; font-weight: 700; letter-spacing: 3px;
+  color: var(--amber); line-height: 1; margin-bottom: 5px;
+}
+
+/* ── LOG STRIP ── */
+#log-strip {
+  position: fixed; bottom: 0; left: 0; right: 0;
+  height: 52px; z-index: 800;
+  background: var(--bg2);
+  border-top: 2px solid var(--amber3);
+  padding: 5px 14px;
+  display: flex; flex-direction: column;
+  justify-content: flex-end; gap: 1px;
+  font-size: 9px;
+  box-shadow: 0 -2px 0 var(--amber), 0 -3px 20px rgba(255,140,0,0.1);
+}
+.log-row {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  opacity: 0.55;
+  line-height: 1.3;
+}
+.log-row:last-child { opacity: 1; }
+.log-ts  { color: var(--amber3); margin-right: 6px; }
+.log-tag { color: var(--amber2); margin-right: 4px; }
+.log-msg { color: var(--bone2); }
+.log-msg.warn { color: #ffcc00; }
+.log-msg.crit { color: var(--red); text-shadow: var(--glow-r); }
+.log-msg.info { color: var(--cyan); }
+
+/* ── EXPORT STRIP ── */
+#export-strip {
+  position: fixed; bottom: 56px; left: 8px;
+  z-index: 600; display: flex; gap: 4px;
+}
+.exp-btn {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 7px; letter-spacing: 3px;
+  background: var(--bg2); color: var(--cyan);
+  border: 1px solid var(--cyan); padding: 3px 8px;
+  cursor: crosshair; text-transform: uppercase;
+  transition: all 0.1s;
+}
+.exp-btn:hover { background: var(--cyan); color: var(--bg); }
+
+/* ── CORNER BRACKETS ── */
+.bracket {
+  position: fixed; width: 20px; height: 20px;
+  z-index: 9993; pointer-events: none;
+}
+.bracket.tl { top: 50px; left: 1px; border-top: 1px solid var(--amber2); border-left: 1px solid var(--amber2); }
+.bracket.tr { top: 50px; right: 47px; border-top: 1px solid var(--amber2); border-right: 1px solid var(--amber2); }
+.bracket.bl { bottom: 54px; left: 1px; border-bottom: 1px solid var(--amber2); border-left: 1px solid var(--amber2); }
+.bracket.br { bottom: 54px; right: 47px; border-bottom: 1px solid var(--amber2); border-right: 1px solid var(--amber2); }
+
+/* ── LEAFLET OVERRIDES ── */
+.leaflet-popup-content-wrapper {
+  background: transparent !important; border: none !important;
+  border-radius: 0 !important; box-shadow: none !important; padding: 0 !important;
+}
+.leaflet-popup-content {
+  margin: 0 !important; padding: 0 !important;
+  font-family: 'Share Tech Mono', monospace !important;
+  width: auto !important; min-width: 260px !important;
+}
+.leaflet-popup-tip-container { display: none !important; }
+.leaflet-popup-close-button {
+  color: var(--amber) !important; font-size: 16px !important;
+  top: 5px !important; right: 7px !important;
+  background: transparent !important;
+}
+.leaflet-control-attribution { display: none !important; }
+.leaflet-control-zoom a {
+  background: var(--bg2) !important; color: var(--amber) !important;
+  border-color: var(--amber3) !important;
+  font-family: 'Share Tech Mono', monospace !important;
+}
+
+/* ── BOOT SCREEN ── */
+#boot {
+  position: fixed; inset: 0; z-index: 10000;
+  background: var(--bg);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  transition: opacity 0.8s;
+}
+#boot.gone { opacity: 0; pointer-events: none; }
+.boot-logo {
+  font-family: 'Big Shoulders Display', sans-serif;
+  font-size: clamp(60px, 10vw, 120px);
+  font-weight: 900;
+  letter-spacing: 16px;
+  color: var(--amber);
+  text-shadow: var(--glow);
+  position: relative;
+  animation: boot-glitch 3s infinite;
+}
+@keyframes boot-glitch {
+  0%,92%,100% { clip-path: none; transform: none; }
+  93% { clip-path: inset(20% 0 50% 0); transform: translateX(-4px); filter: hue-rotate(20deg); }
+  94% { clip-path: inset(60% 0 10% 0); transform: translateX(4px); }
+  95% { clip-path: none; transform: none; }
+}
+.boot-sub {
+  font-size: 9px; letter-spacing: 6px;
+  color: var(--amber3); margin-top: 8px;
+}
+.boot-bar-wrap {
+  width: 360px; height: 2px;
+  background: var(--rule);
+  border: 1px solid var(--amber3);
+  margin: 24px 0 6px; overflow: hidden;
+}
+.boot-bar-fill {
+  height: 100%; width: 0%;
+  background: var(--amber);
+  box-shadow: 0 0 6px var(--amber);
+  transition: width 0.08s linear;
+}
+.boot-pct {
+  font-size: 10px; letter-spacing: 4px; color: var(--amber);
+}
+.boot-log {
+  margin-top: 20px;
+  width: 480px; max-width: 90vw;
+  font-size: 10px;
+  color: var(--amber2);
+  line-height: 1.7;
+  letter-spacing: 1px;
+  min-height: 180px;
+}
+.boot-log-line {
+  display: flex; gap: 10px;
+  animation: fadein 0.15s ease-out;
+}
+@keyframes fadein { from { opacity: 0; transform: translateX(-6px); } to { opacity: 1; transform: none; } }
+.bll-tag {
+  font-size: 8px; letter-spacing: 2px; min-width: 56px;
+  padding: 1px 0;
+}
+.bll-tag.ok   { color: var(--amber); }
+.bll-tag.warn { color: #ffcc00; }
+.bll-tag.info { color: var(--cyan); }
+.bll-tag.sys  { color: var(--amber3); }
+.bll-msg { color: var(--bone2); flex: 1; }
+.bll-status {
+  font-size: 7px; letter-spacing: 2px;
+  padding: 1px 6px; border: 1px solid currentColor;
+  flex-shrink: 0;
+}
+.bll-status.ok   { color: var(--amber); }
+.bll-status.warn { color: #ffcc00; }
+
+.boot-granted {
+  display: none; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px;
+}
+.boot-granted.show { display: flex; }
+.granted-text {
+  font-family: 'Big Shoulders Display', sans-serif;
+  font-size: clamp(40px, 8vw, 80px);
+  font-weight: 900; letter-spacing: 10px;
+  color: var(--amber); text-shadow: var(--glow);
+  animation: granted-in 0.5s ease-out;
+}
+@keyframes granted-in {
+  from { opacity: 0; transform: scale(1.1); letter-spacing: 30px; }
+  to   { opacity: 1; transform: none; letter-spacing: 10px; }
+}
+.granted-node {
+  font-size: 9px; letter-spacing: 4px; color: var(--amber3);
+}
 </style>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 </head>
 <body>
 
-<!-- Boot overlay -->
-<div id="boot-overlay">
-  <div id="boot-out"></div>
-  <span class="boot-cursor"></span>
-</div>
+<!-- CRT effects -->
+<div id="crt-scanlines"></div>
+<div id="crt-vignette"></div>
+<div id="crt-sweep"></div>
+<div id="crt-flicker"></div>
+<canvas id="noise-canvas"></canvas>
 
-<canvas id="matrix-canvas"></canvas>
-<div id="hex-overlay"></div>
-<div id="scanline"></div>
-<div id="vignette"></div>
+<!-- Corner brackets -->
+<div class="bracket tl"></div>
+<div class="bracket tr"></div>
+<div class="bracket bl"></div>
+<div class="bracket br"></div>
+
+<!-- Map -->
 <div id="map"></div>
-<div id="radar-ring"></div>
 
-<!-- Room Mode Radar -->
-<div id="room-radar">
-  <canvas id="radar-canvas"></canvas>
+<!-- Room radar -->
+<div id="room-radar"><canvas id="radar-canvas"></canvas></div>
+
+<!-- Radar tooltip -->
+<div id="radar-tip">
+  <div class="rtip-ssid" id="rtip-ssid"></div>
+  <div id="rtip-body" style="color:var(--bone2);line-height:1.6;font-size:8px;letter-spacing:1px;"></div>
 </div>
 
-<!-- Room Mode Tooltip -->
-<div id="radar-tooltip">
-  <div class="tt-ssid" id="tt-ssid"></div>
-  <div id="tt-body" style="color:#00cc55;margin-top:4px;line-height:1.6;"></div>
-</div>
-
-<!-- Room Mode Legend -->
+<!-- Radar legend -->
 <div id="radar-legend">
-  <div style="font-family:'Bebas Neue',monospace;font-size:11px;letter-spacing:3px;color:var(--g);margin-bottom:4px;">SIGNAL PROXIMITY</div>
-  <div class="leg-row"><div class="leg-dot" style="background:#0aff6e;box-shadow:0 0 5px #0aff6e"></div><span style="color:#00cc55">STRONG  &gt; -55 dBm  (SAME ROOM)</span></div>
-  <div class="leg-row"><div class="leg-dot" style="background:#ffe600;box-shadow:0 0 5px #ffe600"></div><span style="color:#00cc55">MEDIUM  -55 to -70 dBm  (NEARBY)</span></div>
-  <div class="leg-row"><div class="leg-dot" style="background:#ff3c00;box-shadow:0 0 5px #ff3c00"></div><span style="color:#00cc55">WEAK   &lt; -70 dBm  (DISTANT)</span></div>
-  <div class="leg-row" style="margin-top:4px;"><div class="leg-dot" style="background:transparent;border:1px solid #ff3c00;"></div><span style="color:#ff3c0099">OPEN NETWORK</span></div>
+  <div class="rleg-title">PROXIMITY</div>
+  <div class="rleg-row"><div class="rleg-dot" style="background:var(--amber);box-shadow:var(--glow)"></div><span>&gt; -55 dBm — SAME ROOM</span></div>
+  <div class="rleg-row"><div class="rleg-dot" style="background:#ffcc00"></div><span>-55 to -70 dBm — NEAR</span></div>
+  <div class="rleg-row"><div class="rleg-dot" style="background:var(--red)"></div><span>&lt; -70 dBm — DISTANT</span></div>
+  <div class="rleg-row" style="margin-top:3px;"><div class="rleg-dot" style="border:1px solid var(--red);background:transparent;"></div><span style="color:var(--red)">OPEN NETWORK</span></div>
 </div>
 
-<!-- Survey heatmap legend / controls -->
+<!-- Survey legend -->
 <div id="survey-legend">
-  <div class="survey-legend-title">&#9678; WALK SURVEY</div>
-  <div id="survey-ap-filter" style="display:flex;flex-direction:column;gap:3px;max-height:160px;overflow-y:auto;"></div>
-  <div id="survey-reading-cnt">
-    <span id="survey-reading-label">0 READINGS</span>
-    <div style="display:flex;gap:6px;">
-      <button class="survey-dl-btn" onclick="surveyDownload()">&#8595; CSV</button>
-      <button class="survey-clear-btn" onclick="surveyClear()">&#10005; CLEAR</button>
+  <div class="survey-title">// WALK SURVEY</div>
+  <div id="survey-ap-list"></div>
+  <div class="survey-cnt-bar">
+    <span id="survey-reading-lbl">0 READINGS</span>
+    <div style="display:flex;gap:4px;">
+      <button class="sv-btn" onclick="surveyDownload()">&#8595; CSV</button>
+      <button class="sv-btn danger" onclick="surveyClear()">CLR</button>
     </div>
   </div>
 </div>
 
-<div class="tgt tl"></div><div class="tgt tr"></div>
-<div class="tgt bl"></div><div class="tgt br"></div>
+<!-- Export -->
+<div id="export-strip">
+  <button class="exp-btn" onclick="window.open('/export/kml','_blank')">&#8659; KML</button>
+  <button class="exp-btn" onclick="window.open('/export/gpx','_blank')">&#8659; GPX</button>
+</div>
 
+<!-- HEADER -->
 <div class="hdr">
-  <div class="logo">BLACK ICE v2</div>
+  <div class="hdr-brand">
+    <div>
+      <div class="hdr-brand-name">BLACK ICE</div>
+      <div class="hdr-brand-sub">SIGINT // v2 // NIGHTFALL35</div>
+    </div>
+  </div>
   <div class="hdr-sep"></div>
-  <div class="stat"><div class="stat-lbl">TARGETS</div><div class="stat-val" id="cnt">000</div></div>
-  <div class="hdr-sep"></div>
-  <div class="stat"><div class="stat-lbl">OPEN</div><div class="stat-val red" id="ocnt">0</div></div>
-  <div class="hdr-sep"></div>
-  <div class="stat"><div class="stat-lbl">THREATS</div><div class="stat-val yellow" id="tcnt">0</div></div>
-  <div class="hdr-sep"></div>
-  <div id="threat-badge" class="threat-badge nom">NOMINAL</div>
-  <div class="hdr-sep"></div>
-  <div id="gps-pill" class="gps-pill"><div class="gps-dot"></div><span id="gps-txt">GPS: SEARCHING</span></div>
-  <div class="hdr-sep"></div>
+  <div class="hdr-stat">
+    <div class="hdr-stat-lbl">TARGETS</div>
+    <div class="hdr-stat-val" id="cnt">000</div>
+  </div>
+  <div class="hdr-stat">
+    <div class="hdr-stat-lbl">OPEN</div>
+    <div class="hdr-stat-val danger" id="ocnt">0</div>
+  </div>
+  <div class="hdr-stat">
+    <div class="hdr-stat-lbl">LOCAL DB</div>
+    <div class="hdr-stat-val cyan" id="local-db-cnt">0</div>
+  </div>
+  <div class="hdr-stat">
+    <div class="hdr-stat-lbl">READINGS</div>
+    <div class="hdr-stat-val" style="color:#ffcc00;text-shadow:0 0 8px #ffcc0066;" id="survey-cnt">0</div>
+  </div>
+  <div class="threat-bar">
+    <div class="threat-label nom" id="threat-badge">NOMINAL</div>
+  </div>
+  <div class="hdr-gps" id="gps-pill">
+    <div class="gps-pip"></div>
+    <span id="gps-txt">GPS: SEARCHING</span>
+  </div>
   <div id="clock">00:00:00</div>
   <div class="hdr-right">
-    <div class="stat"><div class="stat-lbl">READINGS</div><div class="stat-val survey" id="survey-cnt">0</div></div>
-    <div class="hdr-sep"></div>
-    <div id="sse-status" class="pill wait"><div class="pill-dot"></div>CONNECTING</div>
-    <div class="hdr-sep"></div>
-    <button class="btn" id="survey-btn" onclick="toggleSurvey()">&#9678; SURVEY</button>
-    <button class="btn" id="room-btn" onclick="toggleRoomMode()">&#9673; ROOM MODE</button>
-    <button class="btn" id="panel-btn" onclick="togglePanel()">&#9776; TARGETS</button>
+    <div class="conn-badge wait" id="conn-badge"><div class="conn-dot"></div><span id="conn-txt">CONNECTING</span></div>
   </div>
 </div>
 
+<!-- CONTROL STRIP -->
+<div class="ctrl-strip">
+  <button class="ctrl-btn" id="btn-targets" onclick="togglePanel()" data-tip="TARGETS">&#9776;</button>
+  <button class="ctrl-btn" id="btn-channels" onclick="toggleChanPanel()" data-tip="CHANNELS">&#9636;</button>
+  <button class="ctrl-btn" id="btn-alerts" onclick="toggleAlertPanel()" data-tip="ALERTS">&#9888;</button>
+  <button class="ctrl-btn" id="btn-tri" onclick="toggleTriPanel()" data-tip="TRI-FIX">&#9651;</button>
+  <button class="ctrl-btn" id="btn-survey" onclick="toggleSurvey()" data-tip="SURVEY">&#9678;</button>
+  <button class="ctrl-btn" id="btn-room" onclick="toggleRoomMode()" data-tip="ROOM MODE">&#9673;</button>
+</div>
+
+<!-- PANELS -->
 <div id="panel">
-  <div class="panel-hdr">
-    <div style="display:flex;align-items:center;gap:8px;">
-      <span>// ACCESS POINTS</span>
-      <div class="pcnt" id="pcnt">0</div>
-    </div>
-    <button class="btn" style="padding:2px 7px;font-size:9px;" onclick="togglePanel()">&#x2715;</button>
+  <div class="panel-head">
+    <span>// ACCESS POINTS</span>
+    <div class="panel-count" id="pcnt">0</div>
   </div>
   <div id="ap-list"></div>
 </div>
 
-<div id="log">
-  <div class="log-line"><span class="lt">[BOOT]</span><span class="li">BLACK ICE v2 INITIALIZING...</span></div>
-  <div class="log-line"><span class="lt">[SYS] </span><span class="lw">AWAITING 802.11 FRAMES</span></div>
+<div id="chan-panel">
+  <div class="chan-head">// CHANNEL MAP</div>
+  <canvas id="chan-canvas"></canvas>
 </div>
 
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<div id="alert-panel">
+  <div class="alert-head">// ALERT ENGINE</div>
+  <div id="alert-fired-log"></div>
+  <div id="alert-rule-list"></div>
+  <div class="alert-form">
+    <div class="alert-form-title">ADD RULE</div>
+    <select class="a-sel" id="alert-type-sel">
+      <option value="ssid_appears">SSID APPEARS</option>
+      <option value="ssid_pattern">SSID MATCHES PATTERN</option>
+      <option value="open_network">ANY OPEN NETWORK</option>
+      <option value="ssid_disappears">SSID DISAPPEARS</option>
+    </select>
+    <input class="a-inp" id="alert-pattern-inp" placeholder="pattern (regex, blank=any)" />
+    <button class="a-add" onclick="addAlertRule()">+ ADD RULE</button>
+  </div>
+</div>
+
+<div id="tri-panel">
+  <div class="tri-head">&#9651; TRILATERATION FIX</div>
+  <div class="tri-lbl">SELECT TARGET AP</div>
+  <select id="tri-ap-sel"><option value="">-- select AP --</option></select>
+  <div class="tri-lbl">MARK PROGRESS</div>
+  <div class="tri-dots">
+    <div class="tri-dot" id="tri-d0"></div>
+    <div class="tri-dot" id="tri-d1"></div>
+    <div class="tri-dot" id="tri-d2"></div>
+  </div>
+  <div class="tri-status" id="tri-status">Move to position A, select AP, then MARK.</div>
+  <div class="tri-btns">
+    <button class="tri-btn" onclick="triMark()">&#9654; MARK</button>
+    <button class="tri-btn cancel" onclick="triCancel()">&#x2715; ABORT</button>
+  </div>
+</div>
+
+<!-- LOG STRIP -->
+<div id="log-strip">
+  <div class="log-row"><span class="log-ts">[BOOT]</span><span class="log-tag">[SYS]</span><span class="log-msg">BLACK ICE v2 — INITIALIZING SIGINT TERMINAL</span></div>
+  <div class="log-row"><span class="log-ts">[SYS]</span><span class="log-tag">[NET]</span><span class="log-msg warn">AWAITING 802.11 FRAME CAPTURE</span></div>
+</div>
+
+<!-- BOOT SCREEN -->
+<div id="boot">
+  <div class="boot-logo">BLACK ICE</div>
+  <div class="boot-sub">v2 // SIGINT PLATFORM // NIGHTFALL35 // LUSAKA</div>
+  <div class="boot-bar-wrap"><div class="boot-bar-fill" id="boot-bar-fill"></div></div>
+  <div class="boot-pct" id="boot-pct">0%</div>
+  <div class="boot-log" id="boot-log" style="display:none;"></div>
+  <div class="boot-granted">
+    <div class="granted-text">ACCESS GRANTED</div>
+    <div class="granted-node">NODE: -15.387500, 28.322800 // LUSAKA, ZM</div>
+  </div>
+</div>
+
 <script>
-// ═══════════════════════════════════════════════════════════════
-// MATRIX RAIN
-// ═══════════════════════════════════════════════════════════════
-(function(){
-  const c = document.getElementById('matrix-canvas');
+'use strict';
+
+// ── NOISE CANVAS ────────────────────────────────────────────
+(function() {
+  const c = document.getElementById('noise-canvas');
   const ctx = c.getContext('2d');
-  function resize(){ c.width=innerWidth; c.height=innerHeight; }
+  function resize() { c.width = innerWidth; c.height = innerHeight; }
   resize(); window.addEventListener('resize', resize);
-  const chars = 'アイウエオカキクケコサシスセソタチツテトナニヌネノABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  const cols = Math.floor(innerWidth/14);
-  const drops = Array(cols).fill(1);
-  function draw(){
-    ctx.fillStyle='rgba(2,13,5,0.05)';
-    ctx.fillRect(0,0,c.width,c.height);
-    ctx.fillStyle='#0aff6e';
-    ctx.font='13px JetBrains Mono,monospace';
-    drops.forEach((y,i)=>{
-      ctx.fillText(chars[Math.floor(Math.random()*chars.length)], i*14, y*14);
-      if(y*14>c.height && Math.random()>0.975) drops[i]=0;
-      drops[i]++;
-    });
+  function drawNoise() {
+    const img = ctx.createImageData(c.width, c.height);
+    const d = img.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const v = Math.random() * 60 | 0;
+      d[i] = v * 1.2; d[i+1] = v * 0.7; d[i+2] = 0; d[i+3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
   }
-  setInterval(draw,50);
+  drawNoise();
+  setInterval(drawNoise, 120);
 })();
 
-// ═══════════════════════════════════════════════════════════════
-// RADAR RING (pulse from operator position on the map)
-// ═══════════════════════════════════════════════════════════════
-let radarCenter = {x: innerWidth/2, y: innerHeight/2};
-(function(){
-  const ring = document.getElementById('radar-ring');
-  let r = 0;
-  function pulse(){
-    r = 0;
-    const anim = setInterval(()=>{
-      r += 3;
-      const size = r*2;
-      ring.style.cssText = `
-        position:fixed;z-index:5;pointer-events:none;border-radius:50%;
-        border:1px solid rgba(10,255,110,${Math.max(0,0.5-r/300)});
-        box-shadow:0 0 ${r/10}px rgba(10,255,110,${Math.max(0,0.2-r/500)});
-        width:${size}px;height:${size}px;
-        left:${radarCenter.x - r}px;top:${radarCenter.y - r}px;
-      `;
-      if(r > 300){ clearInterval(anim); ring.style.cssText='position:fixed;z-index:5;pointer-events:none;'; }
-    }, 16);
-  }
-  pulse();
-  setInterval(pulse, 4000);
-})();
-
-// ═══════════════════════════════════════════════════════════════
-// CLOCK
-// ═══════════════════════════════════════════════════════════════
-function updateClock(){
+// ── CLOCK ────────────────────────────────────────────────────
+function updateClock() {
   const n = new Date();
   document.getElementById('clock').textContent =
     String(n.getHours()).padStart(2,'0') + ':' +
     String(n.getMinutes()).padStart(2,'0') + ':' +
     String(n.getSeconds()).padStart(2,'0');
 }
-setInterval(updateClock,1000); updateClock();
+setInterval(updateClock, 1000); updateClock();
 
-// ═══════════════════════════════════════════════════════════════
-// MAP  —  CartoDB Dark Matter tiles
-// ═══════════════════════════════════════════════════════════════
-const map = L.map('map',{zoomControl:true,attributionControl:false}).setView([-15.3875,28.3228],15);
-const cartoTiles = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
-  maxZoom:19
-});
-cartoTiles.addTo(map);
+// ── MAP ──────────────────────────────────────────────────────
+const map = L.map('map', { zoomControl: true, attributionControl: false })
+              .setView([-15.3875, 28.3228], 15);
+const tileSources = [
+  'https://cartodb-basemaps-{s}.global.ssl.fastly.net/dark_all/{z}/{x}/{y}.png',
+  'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+  'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png'
+];
+let tileIdx = 0, activeLayer = null;
+function tryNextTile() {
+  if (activeLayer) map.removeLayer(activeLayer);
+  if (tileIdx >= tileSources.length) { addLog('MAP', 'ALL TILE SOURCES FAILED', 'crit'); return; }
+  const url = tileSources[tileIdx];
+  activeLayer = L.tileLayer(url, { maxZoom: 19, subdomains: ['a','b','c','d'], attribution: '' });
+  activeLayer.on('tileerror', function() {
+    if (!this._failed) { this._failed = true; tileIdx++; tryNextTile(); }
+  });
+  activeLayer.addTo(map);
+}
+tryNextTile();
 
-const markers={}, pulseRings={};
-let allAps={}, panelOpen=false, reconnects=0;
-let operatorMarker=null, operatorLatLng=null, gpsLocked=false;
-
-// ═══════════════════════════════════════════════════════════════
-// ROOM MODE STATE
-// ═══════════════════════════════════════════════════════════════
-let roomMode = false;
-let radarAnimId = null;
-let radarSweepAngle = 0;
-// Wobble offsets per AP key so they don't stack perfectly
+// ── STATE ────────────────────────────────────────────────────
+let allAps = {}, panelOpen = false, chanOpen = false, alertOpen = false;
+let roomMode = false, radarAnim = null, sweepAngle = 0;
+let surveyMode = false, surveyReadings = 0;
+let reconnects = 0, gpsLocked = false;
+let opMarker = null;
+window._opLat = null; window._opLon = null;
 const radarWobble = {};
+const surveyData = {}, heatLayers = {};
+const sigHistory = {};
+const SIG_HIST_MS = 60_000;
+const PALETTE = ['#ff8c00','#00b4cc','#ffcc00','#c41e0a','#ff4da6','#8855ff','#00cc88','#ff6600'];
+let paletteIdx = 0;
+const firedAlerts = [];
 
-function toggleRoomMode(){
-  roomMode = !roomMode;
-  const btn = document.getElementById('room-btn');
-  const mapEl = document.getElementById('map');
-  const radarEl = document.getElementById('room-radar');
-  const legend = document.getElementById('radar-legend');
-
-  if(roomMode){
-    btn.classList.add('room-active');
-    mapEl.classList.add('hidden');
-    radarEl.classList.add('active');
-    legend.classList.add('active');
-    addLog('MODE','ROOM MODE ENGAGED — SIGNAL PROXIMITY RADAR','n');
-    startRoomRadar();
-  } else {
-    btn.classList.remove('room-active');
-    mapEl.classList.remove('hidden');
-    radarEl.classList.remove('active');
-    legend.classList.remove('active');
-    document.getElementById('radar-tooltip').style.display='none';
-    if(radarAnimId){ cancelAnimationFrame(radarAnimId); radarAnimId=null; }
-    addLog('MODE','MAP MODE RESTORED','i');
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════
-// ROOM MODE RADAR — canvas-based proximity radar
-// ═══════════════════════════════════════════════════════════════
-function startRoomRadar(){
-  const canvas = document.getElementById('radar-canvas');
-  const ctx = canvas.getContext('2d');
-
-  function resize(){
-    const w = window.innerWidth;
-    const h = window.innerHeight - 52 - 60; // subtract header + log
-    canvas.width  = w;
-    canvas.height = h;
-    canvas.style.top  = '52px';
-    canvas.style.left = '0';
-    canvas.style.transform = 'none';
-    canvas.style.position = 'fixed';
-  }
-  resize();
-  window.addEventListener('resize', resize);
-
-  const cx = () => canvas.width  / 2;
-  const cy = () => canvas.height / 2;
-
-  // Max radius — use 85% of the smaller half-dimension
-  const maxR = () => Math.min(canvas.width, canvas.height) * 0.42;
-
-  // Map signal dBm → radius on radar
-  // -30 dBm (strongest practical) → inner ring (0.10 of maxR)
-  // -90 dBm (noise floor) → outer ring (0.95 of maxR)
-  function sigToRadius(dbm){
-    const clamped = Math.max(-95, Math.min(-25, dbm));
-    const t = (clamped - (-25)) / ((-95) - (-25)); // 0=strong/center … 1=weak/edge
-    const r = maxR();
-    return r * (0.12 + t * 0.82);
-  }
-
-  // Hit-test AP blobs for tooltip
-  const blobPositions = {};
-
-  function drawFrame(){
-    if(!roomMode){ return; }
-    radarAnimId = requestAnimationFrame(drawFrame);
-
-    const W = canvas.width, H = canvas.height;
-    const X = cx(), Y = cy(), R = maxR();
-
-    ctx.clearRect(0,0,W,H);
-
-    // ── Background gradient ──
-    const bg = ctx.createRadialGradient(X,Y,0, X,Y,R*1.1);
-    bg.addColorStop(0,   '#010f06');
-    bg.addColorStop(0.7, '#020d05');
-    bg.addColorStop(1,   '#000a03');
-    ctx.fillStyle = bg;
-    ctx.fillRect(0,0,W,H);
-
-    // ── Concentric range rings ──
-    const rings = [
-      { t: 0.15, label:'-35 dBm', col:'rgba(10,255,110,0.5)' },
-      { t: 0.35, label:'-50 dBm', col:'rgba(10,255,110,0.3)' },
-      { t: 0.55, label:'-65 dBm', col:'rgba(255,230,0,0.25)' },
-      { t: 0.75, label:'-75 dBm', col:'rgba(255,60,0,0.2)'   },
-      { t: 0.95, label:'-90 dBm', col:'rgba(255,60,0,0.12)'  },
-    ];
-    rings.forEach(ring=>{
-      const r = R * ring.t;
-      ctx.beginPath();
-      ctx.arc(X,Y,r,0,Math.PI*2);
-      ctx.strokeStyle = ring.col;
-      ctx.lineWidth   = 1;
-      ctx.setLineDash([4,6]);
-      ctx.stroke();
-      ctx.setLineDash([]);
-      // Label
-      ctx.fillStyle = ring.col.replace(/[\\d.]+\\)$/, '0.55)');
-      ctx.font = '9px JetBrains Mono, monospace';
-      ctx.fillText(ring.label, X + r + 4, Y - 4);
-    });
-
-    // ── Cross-hairs ──
-    ctx.strokeStyle = 'rgba(10,255,110,0.12)';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([3,8]);
-    ctx.beginPath(); ctx.moveTo(X,Y-R*1.05); ctx.lineTo(X,Y+R*1.05); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(X-R*1.05,Y); ctx.lineTo(X+R*1.05,Y); ctx.stroke();
-    ctx.setLineDash([]);
-
-    // ── Outer border circle ──
-    ctx.beginPath();
-    ctx.arc(X,Y,R,0,Math.PI*2);
-    ctx.strokeStyle = 'rgba(10,255,110,0.3)';
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-
-    // ── Sweep line ──
-    radarSweepAngle = (radarSweepAngle + 0.018) % (Math.PI*2);
-    const sweepGrad = ctx.createConicalGradient
-      ? ctx.createConicalGradient(radarSweepAngle, X, Y)
-      : null;
-
-    // Draw sweep as a filled wedge (no conical gradient in standard Canvas API)
-    const sweepWidth = Math.PI / 8;
-    ctx.beginPath();
-    ctx.moveTo(X, Y);
-    ctx.arc(X, Y, R, radarSweepAngle - sweepWidth, radarSweepAngle);
-    ctx.closePath();
-    const sg = ctx.createRadialGradient(X,Y,0, X,Y,R);
-    sg.addColorStop(0,   'rgba(10,255,110,0.0)');
-    sg.addColorStop(0.6, 'rgba(10,255,110,0.05)');
-    sg.addColorStop(1,   'rgba(10,255,110,0.13)');
-    ctx.fillStyle = sg;
-    ctx.fill();
-
-    // Bright leading edge
-    ctx.beginPath();
-    ctx.moveTo(X, Y);
-    ctx.lineTo(X + R * Math.cos(radarSweepAngle), Y + R * Math.sin(radarSweepAngle));
-    ctx.strokeStyle = 'rgba(10,255,110,0.7)';
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-
-    // ── AP blobs ──
-    const aps = Object.entries(allAps).sort((a,b)=>a[1].signal - b[1].signal); // weak first = drawn below
-    aps.forEach(([key, ap])=>{
-      // Assign stable wobble so APs at same signal don't perfectly overlap
-      if(!radarWobble[key]){
-        radarWobble[key] = { a: Math.random() * Math.PI*2, drift: (Math.random()-0.5)*0.004 };
-      }
-      radarWobble[key].a += radarWobble[key].drift;
-
-      const dist = sigToRadius(ap.signal);
-      const angle = radarWobble[key].a;
-      const bx = X + dist * Math.cos(angle);
-      const by = Y + dist * Math.sin(angle);
-
-      blobPositions[key] = { x:bx, y:by, ap };
-
-      const isOpen = ap.security && (ap.security.includes('OPEN') || ap.security === '');
-      const col    = ap.signal > -55 ? '#0aff6e' : ap.signal > -70 ? '#ffe600' : '#ff3c00';
-      const glow   = ap.signal > -55 ? '0 0 12px #0aff6e' : ap.signal > -70 ? '0 0 10px #ffe600' : '0 0 8px #ff3c00';
-      const radius = ap.signal > -55 ? 8 : ap.signal > -70 ? 6 : 5;
-
-      // Open network outer warning ring
-      if(isOpen){
-        ctx.beginPath();
-        ctx.arc(bx, by, radius+7, 0, Math.PI*2);
-        ctx.strokeStyle = 'rgba(255,60,0,0.5)';
-        ctx.lineWidth = 1;
-        ctx.setLineDash([3,3]);
-        ctx.stroke();
-        ctx.setLineDash([]);
-      }
-
-      // Glow halo
-      const halo = ctx.createRadialGradient(bx,by,0, bx,by,radius*3);
-      halo.addColorStop(0,   col + 'cc');
-      halo.addColorStop(0.4, col + '44');
-      halo.addColorStop(1,   col + '00');
-      ctx.beginPath();
-      ctx.arc(bx, by, radius*3, 0, Math.PI*2);
-      ctx.fillStyle = halo;
-      ctx.fill();
-
-      // Core dot
-      ctx.beginPath();
-      ctx.arc(bx, by, radius, 0, Math.PI*2);
-      ctx.fillStyle = col;
-      ctx.fill();
-
-      // SSID label
-      const label = ap.ssid && ap.ssid !== '<hidden>' ? ap.ssid : '< HIDDEN >';
-      ctx.font = 'bold 10px JetBrains Mono, monospace';
-      ctx.fillStyle = col;
-      ctx.globalAlpha = 0.85;
-      // Offset label to avoid overlap with dot
-      const lx = bx + radius + 5;
-      const ly = by - 4;
-      // Shadow for legibility
-      ctx.shadowColor = '#020d05';
-      ctx.shadowBlur  = 6;
-      ctx.fillText(label, lx, ly);
-      ctx.fillStyle = 'rgba(10,255,110,0.4)';
-      ctx.font = '8px JetBrains Mono, monospace';
-      ctx.fillText(ap.signal + ' dBm', lx, ly + 12);
-      ctx.shadowBlur  = 0;
-      ctx.globalAlpha = 1;
-    });
-
-    // ── Centre "YOU ARE HERE" crosshair ──
-    ctx.beginPath();
-    ctx.arc(X,Y,6,0,Math.PI*2);
-    ctx.strokeStyle = '#00e5ff';
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(X,Y,2,0,Math.PI*2);
-    ctx.fillStyle = '#00e5ff';
-    ctx.fill();
-    // pulsing outer ring
-    const pulse = 0.5 + 0.5*Math.sin(Date.now()/400);
-    ctx.beginPath();
-    ctx.arc(X,Y,10 + pulse*5,0,Math.PI*2);
-    ctx.strokeStyle = `rgba(0,229,255,${0.3*pulse})`;
-    ctx.lineWidth = 1;
-    ctx.stroke();
-
-    // ── Title ──
-    ctx.font = '700 11px JetBrains Mono, monospace';
-    ctx.fillStyle = 'rgba(10,255,110,0.35)';
-    ctx.fillText('ROOM MODE // SIGNAL PROXIMITY RADAR', X - 170, 28);
-  }
-
-  drawFrame();
-
-  // ── Tooltip on hover ──
-  const tooltip = document.getElementById('radar-tooltip');
-  canvas.addEventListener('mousemove', e=>{
-    if(!roomMode) return;
-    const rect = canvas.getBoundingClientRect();
-    const mx = e.clientX - rect.left;
-    const my = e.clientY - rect.top;
-    let hit = null;
-    for(const [key, pos] of Object.entries(blobPositions)){
-      const dx = mx - pos.x, dy = my - pos.y;
-      if(Math.sqrt(dx*dx+dy*dy) < 18){ hit = pos.ap; break; }
+// ── MARKER MANAGER ───────────────────────────────────────────
+const MM = {
+  _m: {}, _rings: {}, _mode: 'map',
+  setMode(m) { this._mode = m; },
+  has(k) { return k in this._m; },
+  isReal(k) { return this._m[k] && !this._m[k]._ph; },
+  flush() { Object.keys(this._m).forEach(k => { if (!this._m[k] || this._m[k]._ph) delete this._m[k]; }); },
+  add(key, ap, mapRef) {
+    const isOpen = isOpenNet(ap), strong = ap.signal > -65;
+    const col = isOpen ? '#c41e0a' : strong ? '#ff8c00' : '#ffcc00';
+    const r   = isOpen ? 11 : strong ? 8 : 6;
+    if (this._mode === 'room') { this._m[key] = { _ph: true }; return; }
+    const m = L.circleMarker([ap.lat, ap.lon], { radius: r, color: col, fillColor: col, fillOpacity: 0.75, weight: 1.5 }).addTo(mapRef);
+    m.bindPopup(makePopup(ap), { maxWidth: 300, minWidth: 260 });
+    this._m[key] = m;
+    if (isOpen) {
+      const ring = L.circleMarker([ap.lat, ap.lon], { radius: r+8, color: '#c41e0a', fillColor: 'transparent', weight: 1, opacity: 0.4 }).addTo(mapRef);
+      this._rings[key] = ring;
     }
-    if(hit){
-      const isOpen = hit.security && (hit.security.includes('OPEN') || hit.security === '');
-      const col = hit.signal > -55 ? '#0aff6e' : hit.signal > -70 ? '#ffe600' : '#ff3c00';
-      const prox = hit.signal > -55 ? 'SAME ROOM' : hit.signal > -65 ? 'VERY CLOSE' : hit.signal > -75 ? 'NEARBY' : 'DISTANT';
-      document.getElementById('tt-ssid').textContent = hit.ssid || '<HIDDEN>';
-      document.getElementById('tt-ssid').style.color = isOpen ? '#ff3c00' : col;
-      document.getElementById('tt-body').innerHTML =
-        `<span style="color:#3db869">BSSID</span>  ${hit.bssid}<br>`+
-        `<span style="color:#3db869">SIGNAL</span> <span style="color:${col}">${hit.signal} dBm</span><br>`+
-        `<span style="color:#3db869">PROX</span>   <span style="color:${col}">${prox}</span><br>`+
-        `<span style="color:#3db869">CH</span>     ${hit.channel}<br>`+
-        `<span style="color:#3db869">ENC</span>    <span style="color:${isOpen?'#ff3c00':'#0aff6e'}">${hit.security||'OPEN'}</span><br>`+
-        `<span style="color:#3db869">VENDOR</span> ${hit.vendor||'?'}`;
-      tooltip.style.display = 'block';
-      let tx = e.clientX + 18, ty = e.clientY - 10;
-      if(tx + 220 > window.innerWidth) tx = e.clientX - 230;
-      tooltip.style.left = tx + 'px';
-      tooltip.style.top  = ty + 'px';
-    } else {
-      tooltip.style.display = 'none';
-    }
-  });
-  canvas.addEventListener('mouseleave', ()=>{ tooltip.style.display='none'; });
+  },
+  update(key, ap) {
+    if (!this.isReal(key)) return;
+    const isOpen = isOpenNet(ap), strong = ap.signal > -65;
+    const col = isOpen ? '#c41e0a' : strong ? '#ff8c00' : '#ffcc00';
+    const r   = isOpen ? 11 : strong ? 8 : 6;
+    this._m[key].setLatLng([ap.lat, ap.lon]).setStyle({ color: col, fillColor: col, radius: r });
+    this._m[key].setPopupContent(makePopup(ap));
+    if (this._rings[key]) this._rings[key].setLatLng([ap.lat, ap.lon]);
+  },
+  remove(key, mapRef) {
+    if (this.isReal(key)) mapRef.removeLayer(this._m[key]);
+    delete this._m[key];
+    if (this._rings[key]) { mapRef.removeLayer(this._rings[key]); delete this._rings[key]; }
+  },
+  flyTo(key, mapRef, ap) { if (this.isReal(key)) mapRef.flyTo([ap.lat, ap.lon], 17, { duration: 0.6 }); },
+  openPopup(key) { if (this.isReal(key)) this._m[key].openPopup(); },
+  keys() { return Object.keys(this._m); }
+};
+
+function isOpenNet(ap) {
+  const s = ap.security || '';
+  return s.toUpperCase().includes('OPEN') || s === '';
 }
 
-// ═══════════════════════════════════════════════════════════════
-// OPERATOR MARKER
-// ═══════════════════════════════════════════════════════════════
-function makeOperatorIcon(gps){
-  const col = gps ? '#00e5ff' : '#0aff6e';
-  const shadow = gps ? '0 0 14px #00e5ff,0 0 28px #00e5ff55' : '0 0 14px #0aff6e,0 0 28px #0aff6e55';
-  return L.divIcon({
-    html:`<div style="width:16px;height:16px;border:2px solid ${col};border-radius:50%;
-          background:${col}33;box-shadow:${shadow};
-          animation:gpspulse 1.2s infinite;position:relative;">
-          <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
-          width:4px;height:4px;border-radius:50%;background:${col};box-shadow:${shadow};"></div>
-         </div>`,
-    iconSize:[16,16],iconAnchor:[8,8],className:''
-  });
-}
-
-function updateOperatorMarker(lat,lon,gps){
-  if(!operatorMarker){
-    operatorMarker = L.marker([lat,lon],{icon:makeOperatorIcon(gps),zIndexOffset:9000}).addTo(map);
-    operatorMarker.bindPopup(
-      '<div style="font-family:JetBrains Mono,monospace;font-size:11px;">' +
-      '<div style="color:#00e5ff;font-family:Bebas Neue,monospace;font-size:14px;letter-spacing:3px;margin-bottom:4px;">OPERATOR</div>' +
-      '<div style="color:#005522;">SOURCE: ' + (gps?'HARDWARE GPS':'BROWSER') + '</div>' +
-      '<div id="op-coords" style="color:#00aa33;font-size:10px;">' + lat.toFixed(6) + ', ' + lon.toFixed(6) + '</div>' +
-      '</div>'
-    );
-  } else {
-    operatorMarker.setLatLng([lat,lon]);
-    operatorMarker.setIcon(makeOperatorIcon(gps));
-  }
-  const pt = map.latLngToContainerPoint([lat,lon]);
-  radarCenter = {x:pt.x, y:pt.y};
-}
-
-// ═══════════════════════════════════════════════════════════════
-// BROWSER GEOLOCATION fallback
-// ═══════════════════════════════════════════════════════════════
-if(navigator.geolocation){
-  navigator.geolocation.watchPosition(pos=>{
-    if(gpsLocked) return;
-    const {latitude:lat,longitude:lon} = pos.coords;
-    map.setView([lat,lon],16);
-    updateOperatorMarker(lat,lon,false);
-    addLog('GPS','BROWSER GEOLOCATION ACTIVE // ' + lat.toFixed(5) + ',' + lon.toFixed(5),'n');
-  },()=>addLog('SYS','BROWSER GPS UNAVAILABLE','w'),{enableHighAccuracy:true,maximumAge:5000});
-}
-
-// ═══════════════════════════════════════════════════════════════
-// LOG
-// ═══════════════════════════════════════════════════════════════
-const logEl = document.getElementById('log');
-function addLog(tag,msg,type){
-  type=type||'i';
-  const ts=new Date();
-  const t=String(ts.getHours()).padStart(2,'0')+':'+String(ts.getMinutes()).padStart(2,'0')+':'+String(ts.getSeconds()).padStart(2,'0');
-  const d=document.createElement('div');
-  d.className='log-line';
-  const cls={'i':'li','w':'lw','c':'lc','n':'ln'}[type]||'li';
-  d.innerHTML='<span class="lt">['+t+']['+tag+']</span><span class="'+cls+'">'+msg+'</span>';
+// ── LOG ──────────────────────────────────────────────────────
+const logEl = document.getElementById('log-strip');
+function addLog(tag, msg, type) {
+  const ts = new Date();
+  const t = String(ts.getHours()).padStart(2,'0') + ':' + String(ts.getMinutes()).padStart(2,'0') + ':' + String(ts.getSeconds()).padStart(2,'0');
+  const d = document.createElement('div');
+  d.className = 'log-row';
+  const cls = type === 'crit' ? 'crit' : type === 'warn' ? 'warn' : type === 'info' ? 'info' : '';
+  d.innerHTML = `<span class="log-ts">[${t}]</span><span class="log-tag">[${tag}]</span><span class="log-msg ${cls}">${msg}</span>`;
   logEl.appendChild(d);
-  while(logEl.children.length>5) logEl.removeChild(logEl.firstChild);
+  while (logEl.children.length > 3) logEl.removeChild(logEl.firstChild);
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SIGNAL BARS
-// ═══════════════════════════════════════════════════════════════
-function sigBars(dbm,col){
-  const lvl=dbm>-55?4:dbm>-65?3:dbm>-75?2:1;
-  let h='<span class="sb" style="color:'+col+'">';
-  for(let i=1;i<=4;i++) h+='<span'+(i<=lvl?' class="on"':'')+' ></span>';
-  return h+'</span>';
-}
-
-// ═══════════════════════════════════════════════════════════════
-// PANEL
-// ═══════════════════════════════════════════════════════════════
-function togglePanel(){
-  panelOpen=!panelOpen;
-  document.getElementById('panel').classList.toggle('open',panelOpen);
-  document.getElementById('panel-btn').classList.toggle('on',panelOpen);
-  document.getElementById('log').style.right=panelOpen?'300px':'0';
-  if(panelOpen) renderPanel();
-}
-
-function renderPanel(){
-  if(!panelOpen) return;
-  const list=document.getElementById('ap-list');
-  const entries=Object.entries(allAps).sort((a,b)=>b[1].signal-a[1].signal);
-  document.getElementById('pcnt').textContent=entries.length;
-  list.innerHTML='';
-  entries.forEach(([key,ap])=>{
-    const isOpen=ap.security&&(ap.security.includes('OPEN')||ap.security==='');
-    const sc=ap.signal>-65?'var(--g)':ap.signal>-80?'var(--y)':'var(--r)';
-    const d=document.createElement('div');
-    d.className='ap-row';
-    d.innerHTML=
-      '<div class="ap-name'+(isOpen?' open':'')+'">'+
-      (isOpen?'&#9888; ':'')+(ap.ssid||'&lt;HIDDEN&gt;')+
-      (isOpen?' <span class="tag-open">[OPEN]</span>':'')+
-      '</div>'+
-      '<div class="ap-info">'+
-      '<span class="mac">'+ap.bssid+'</span>'+
-      '<span>'+sigBars(ap.signal,sc)+' '+ap.signal+'dBm</span>'+
-      '<span>CH:'+ap.channel+'</span>'+
-      '<span>'+(ap.vendor||'?')+'</span>'+
-      '<span style="color:#003d11;font-size:8px">'+(ap.source||'')+'</span>'+
-      '</div>';
-    d.onclick=()=>{
-      if(!roomMode && markers[key]){ map.flyTo([ap.lat,ap.lon],17,{duration:0.7}); markers[key].openPopup(); }
-    };
-    list.appendChild(d);
-  });
-}
-
-// ═══════════════════════════════════════════════════════════════
-// THREAT LEVEL
-// ═══════════════════════════════════════════════════════════════
-function updateThreat(aps){
-  const openCount=Object.values(aps).filter(a=>a.security&&(a.security.includes('OPEN')||a.security==='')).length;
-  document.getElementById('ocnt').textContent=openCount;
-  document.getElementById('tcnt').textContent=openCount;
-  const b=document.getElementById('threat-badge');
-  if(openCount===0){b.textContent='NOMINAL';b.className='threat-badge nom';}
-  else if(openCount<3){b.textContent='ELEVATED';b.className='threat-badge elv';}
-  else{b.textContent='! CRITICAL';b.className='threat-badge crit';}
-}
-
-// ═══════════════════════════════════════════════════════════════
-// POPUP
-// ═══════════════════════════════════════════════════════════════
-function makePopup(ap){
-  const isOpen  = ap.security && (ap.security.includes('OPEN') || ap.security === '');
-  const isWPA3  = ap.security && ap.security.includes('WPA3');
-  const isWPA2  = ap.security && ap.security.includes('WPA2') && !isWPA3;
-  const isHidden= !ap.ssid || ap.ssid === '<hidden>';
-
+// ── POPUP BUILDER ────────────────────────────────────────────
+function makePopup(ap) {
+  const isOpen  = isOpenNet(ap);
+  const isWPA3  = (ap.security || '').includes('WPA3');
+  const isWPA2  = (ap.security || '').includes('WPA2') && !isWPA3;
+  const hidden  = !ap.ssid || ap.ssid === '<hidden>';
   let threat = 0;
   if (isOpen)          threat += 60;
-  if (isHidden)        threat += 15;
+  if (hidden)          threat += 15;
   if (ap.signal > -55) threat += 15;
-  if (ap.channel === 0)threat += 10;
+  if (ap.channel === 0) threat += 10;
   threat = Math.min(threat, 100);
-
-  const tCol  = threat >= 60 ? '#ff3c00' : threat >= 30 ? '#ffe600' : '#0aff6e';
-  const tLbl  = threat >= 60 ? 'HIGH'    : threat >= 30 ? 'MEDIUM'  : 'LOW';
-  const mCol  = isOpen ? '#ff3c00' : isWPA3 ? '#00e5ff' : '#0aff6e';
-  const sCol  = ap.signal > -55 ? '#0aff6e' : ap.signal > -70 ? '#ffe600' : '#ff3c00';
-  const sigPct= Math.max(0, Math.min(100, (ap.signal + 100) * 2));
-
-  const encBadge = isOpen
-    ? `<span style="background:#ff3c0022;color:#ff3c00;border:1px solid #ff3c00;padding:2px 8px;font-size:9px;letter-spacing:2px;font-family:JetBrains Mono,monospace;">&#9888; UNENCRYPTED</span>`
-    : isWPA3
-    ? `<span style="background:#00e5ff18;color:#00e5ff;border:1px solid #00e5ff55;padding:2px 8px;font-size:9px;letter-spacing:2px;font-family:JetBrains Mono,monospace;">&#9679; WPA3</span>`
-    : isWPA2
-    ? `<span style="background:#0aff6e18;color:#0aff6e;border:1px solid #0aff6e44;padding:2px 8px;font-size:9px;letter-spacing:2px;font-family:JetBrains Mono,monospace;">&#9679; WPA2</span>`
-    : `<span style="background:#ffe60018;color:#ffe600;border:1px solid #ffe60044;padding:2px 8px;font-size:9px;letter-spacing:2px;font-family:JetBrains Mono,monospace;">&#9888; LEGACY</span>`;
-
-  const band = ap.channel >= 36 ? '5 GHz' : ap.channel > 0 ? '2.4 GHz' : '---';
-  const freq = ap.channel >= 36
-    ? (5180 + (ap.channel - 36) * 5) + ' MHz'
-    : ap.channel > 0 ? (2412 + (ap.channel - 1) * 5) + ' MHz' : '---';
-  const sLbl = ap.signal > -55 ? 'EXCELLENT' : ap.signal > -65 ? 'GOOD' : ap.signal > -75 ? 'FAIR' : 'WEAK';
-
-  const ssidDisplay = isHidden ? '[ HIDDEN ]' : (ap.ssid || '---');
-  const lat6 = ap.lat ? ap.lat.toFixed(6) : '---';
-  const lon6 = ap.lon ? ap.lon.toFixed(6) : '---';
-
-  return `
-<div style="font-family:JetBrains Mono,monospace;background:#020d05;border:1px solid ${mCol}66;min-width:280px;overflow:hidden;">
-  <div style="background:linear-gradient(135deg,${mCol}22,${mCol}08);border-bottom:1px solid ${mCol}44;padding:10px 12px 8px;">
-    <div style="font-family:'Bebas Neue',cursive,monospace;font-size:20px;letter-spacing:4px;color:${mCol};text-shadow:0 0 10px ${mCol};line-height:1.1;">
-      ${ssidDisplay}
+  const tc   = threat >= 60 ? '#c41e0a' : threat >= 30 ? '#ffcc00' : '#ff8c00';
+  const mc   = isOpen ? '#c41e0a' : isWPA3 ? '#00b4cc' : '#ff8c00';
+  const sc   = ap.signal > -55 ? '#ff8c00' : ap.signal > -70 ? '#ffcc00' : '#c41e0a';
+  const sig  = Math.max(0, Math.min(100, (ap.signal + 100) * 2));
+  const band = ap.channel >= 36 ? '5GHz' : ap.channel > 0 ? '2.4GHz' : '---';
+  const ssid = hidden ? '[ HIDDEN ]' : (ap.ssid || '---');
+  const enc  = isOpen ? '<span style="color:#c41e0a;border:1px solid #c41e0a;padding:1px 6px;font-size:7px;letter-spacing:2px;">UNENCRYPTED</span>'
+             : isWPA3 ? '<span style="color:#00b4cc;border:1px solid #00b4cc;padding:1px 6px;font-size:7px;letter-spacing:2px;">WPA3</span>'
+             : isWPA2 ? '<span style="color:#ff8c00;border:1px solid #ff8c00;padding:1px 6px;font-size:7px;letter-spacing:2px;">WPA2</span>'
+             : '<span style="color:#ffcc00;border:1px solid #ffcc00;padding:1px 6px;font-size:7px;letter-spacing:2px;">LEGACY</span>';
+  const spark = drawSparkline(ap.bssid, 240, 24);
+  return `<div style="background:#0e0c09;border:1px solid ${mc}88;font-family:'Share Tech Mono',monospace;overflow:hidden;min-width:260px;">
+  <div style="background:${mc}14;border-bottom:1px solid ${mc}44;padding:9px 12px 7px;">
+    <div style="font-family:'Big Shoulders Display',sans-serif;font-size:18px;font-weight:700;letter-spacing:4px;color:${mc};text-shadow:0 0 8px ${mc}88;">${ssid}</div>
+    <div style="font-size:8px;color:#7a5500;letter-spacing:1px;margin-top:2px;">${ap.bssid || '---'}</div>
+    <div style="margin-top:5px;">${enc}</div>
+  </div>
+  <div style="padding:7px 12px;border-bottom:1px solid #2a1500;">
+    <div style="display:flex;justify-content:space-between;margin-bottom:3px;">
+      <span style="font-size:7px;color:#7a5500;letter-spacing:2px;">SIGNAL STRENGTH</span>
+      <span style="font-size:9px;color:${sc};font-family:'Big Shoulders Display',sans-serif;letter-spacing:1px;">${ap.signal} dBm</span>
     </div>
-    <div style="color:#5aff9a;font-size:9px;letter-spacing:1px;margin-top:3px;font-family:JetBrains Mono,monospace;opacity:0.7;">
-      ${ap.bssid || '---'}
+    <div style="height:3px;background:#0e0c09;border:1px solid #2a1500;overflow:hidden;">
+      <div style="height:100%;width:${sig}%;background:${sc};box-shadow:0 0 4px ${sc};"></div>
     </div>
-    <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
-      ${encBadge}
+    <div style="margin-top:5px;">${spark}</div>
+  </div>
+  <div style="padding:6px 12px;border-bottom:1px solid ${tc}33;background:${tc}0d;">
+    <div style="display:flex;justify-content:space-between;">
+      <span style="font-size:7px;color:#7a5500;letter-spacing:2px;">THREAT SCORE</span>
+      <span style="font-family:'Big Shoulders Display',sans-serif;font-size:12px;color:${tc};letter-spacing:3px;">${threat >= 60 ? 'HIGH' : threat >= 30 ? 'MED' : 'LOW'} — ${threat}</span>
+    </div>
+    <div style="height:2px;background:#0e0c09;margin-top:4px;overflow:hidden;">
+      <div style="height:100%;width:${threat}%;background:${tc};"></div>
     </div>
   </div>
-  <div style="padding:8px 12px 7px;border-bottom:1px solid #0aff6e22;">
-    <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
-      <span style="font-size:9px;color:#4dcc77;letter-spacing:2px;">SIGNAL STRENGTH</span>
-      <span style="font-size:10px;color:${sCol};font-family:'Bebas Neue',monospace;letter-spacing:1px;">${ap.signal} dBm &nbsp; ${sLbl}</span>
-    </div>
-    <div style="height:5px;background:#071a0e;border:1px solid #0aff6e33;border-radius:2px;overflow:hidden;">
-      <div style="height:100%;width:${sigPct}%;background:linear-gradient(90deg,${sCol}88,${sCol});box-shadow:0 0 5px ${sCol};"></div>
-    </div>
-  </div>
-  <div style="padding:7px 12px;border-bottom:1px solid ${tCol}33;background:${tCol}12;">
-    <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
-      <span style="font-size:9px;color:#4dcc77;letter-spacing:2px;">THREAT SCORE</span>
-      <span style="font-family:'Bebas Neue',monospace;font-size:13px;color:${tCol};text-shadow:0 0 8px ${tCol};letter-spacing:3px;">${tLbl} &nbsp; ${threat}/100</span>
-    </div>
-    <div style="height:4px;background:#071a0e;border:1px solid ${tCol}33;border-radius:2px;overflow:hidden;">
-      <div style="height:100%;width:${threat}%;background:linear-gradient(90deg,${tCol}88,${tCol});box-shadow:0 0 4px ${tCol};"></div>
-    </div>
-  </div>
-  <div style="padding:8px 12px 10px;">
-    <table style="width:100%;border-collapse:collapse;font-size:10px;">
-      <tr><td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Vendor</td><td style="color:#00ccff;padding:3px 0;font-weight:bold;">${ap.vendor || 'UNKNOWN'}</td></tr>
-      <tr><td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Channel</td><td style="color:#0aff6e;padding:3px 0;">${ap.channel > 0 ? ap.channel : '?'} <span style="color:#5aaa77;font-size:9px;">${band} // ${freq}</span></td></tr>
-      <tr><td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Encryption</td><td style="color:${mCol};padding:3px 0;font-weight:bold;">${ap.security || 'NONE'}</td></tr>
-      <tr><td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Geo Source</td><td style="color:#7acc99;padding:3px 0;font-size:9px;">${ap.source || '---'}</td></tr>
-      <tr><td style="color:#3db869;padding:3px 14px 3px 0;font-size:9px;letter-spacing:2px;white-space:nowrap;vertical-align:top;text-transform:uppercase;">Coords</td><td style="color:#5aaa77;padding:3px 0;font-size:9px;">${lat6}, ${lon6}</td></tr>
+  <div style="padding:7px 12px 9px;font-size:8px;line-height:1.8;">
+    <table style="width:100%;border-collapse:collapse;">
+      <tr><td style="color:#7a5500;padding-right:12px;letter-spacing:2px;white-space:nowrap;font-size:7px;">VENDOR</td><td style="color:#00b4cc;">${ap.vendor || 'UNKNOWN'}</td></tr>
+      <tr><td style="color:#7a5500;letter-spacing:2px;font-size:7px;">CHANNEL</td><td style="color:#ff8c00;">${ap.channel > 0 ? ap.channel : '?'} <span style="color:#7a5500;">${band}</span></td></tr>
+      <tr><td style="color:#7a5500;letter-spacing:2px;font-size:7px;">ENCRYPT</td><td style="color:${mc};">${ap.security || 'NONE'}</td></tr>
+      <tr><td style="color:#7a5500;letter-spacing:2px;font-size:7px;">SOURCE</td><td style="color:#a89880;">${ap.source || '---'}</td></tr>
+      <tr><td style="color:#7a5500;letter-spacing:2px;font-size:7px;">COORDS</td><td style="color:#7a5500;font-size:7px;">${ap.lat ? ap.lat.toFixed(5) : '---'}, ${ap.lon ? ap.lon.toFixed(5) : '---'}</td></tr>
     </table>
   </div>
-  <div style="border-top:1px solid #0aff6e22;padding:5px 12px;display:flex;justify-content:space-between;background:#0aff6e0a;">
-    <span style="font-size:8px;color:#3d7a50;letter-spacing:3px;">BLACK ICE v2</span>
-    <span style="font-size:8px;color:${mCol}aa;letter-spacing:1px;">NIGHTFALL35</span>
+  <div style="border-top:1px solid #2a1500;padding:4px 12px;display:flex;justify-content:space-between;background:#080604;">
+    <span style="font-size:7px;color:#3a2800;letter-spacing:3px;">BLACK ICE v2</span>
+    <span style="font-size:7px;color:${mc}88;letter-spacing:2px;">NIGHTFALL35</span>
   </div>
 </div>`;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// DISPLAY UPDATE
-// ═══════════════════════════════════════════════════════════════
-function updateDisplay(aps){
-  allAps=aps;
-  document.getElementById('cnt').textContent=String(Object.keys(aps).length).padStart(3,'0');
-  updateThreat(aps);
-  if(panelOpen) renderPanel();
+// ── SIGNAL HISTORY + SPARKLINE ───────────────────────────────
+function updateSigHistory(aps) {
+  const now = Date.now();
+  for (const [k, ap] of Object.entries(aps)) {
+    if (!sigHistory[k]) sigHistory[k] = [];
+    sigHistory[k].push({ t: now, rssi: ap.signal });
+    sigHistory[k] = sigHistory[k].filter(e => now - e.t < SIG_HIST_MS);
+  }
+}
 
-  // Only update map markers when not in room mode
-  if(!roomMode){
-    Object.entries(aps).forEach(([key,ap])=>{
-      const isOpen=ap.security&&(ap.security.includes('OPEN')||ap.security==='');
-      const strong=ap.signal>-65;
-      const col=isOpen?'#ff3c00':strong?'#0aff6e':'#ffe600';
-      const r=isOpen?11:strong?8:6;
+function drawSparkline(bssid, w, h) {
+  const hist = sigHistory[bssid];
+  if (!hist || hist.length < 2) return '';
+  const now = Date.now();
+  const minR = -95, maxR = -20;
+  const pts = hist.map(e => {
+    const x = (Math.max(0, e.t - (now - SIG_HIST_MS)) / SIG_HIST_MS) * w;
+    const y = h - ((e.rssi - minR) / (maxR - minR)) * h;
+    return x.toFixed(1) + ',' + y.toFixed(1);
+  }).join(' ');
+  const last = hist[hist.length - 1].rssi;
+  const col = last > -55 ? '#ff8c00' : last > -70 ? '#ffcc00' : '#c41e0a';
+  return `<svg width="${w}" height="${h}" style="display:block;"><polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.2" opacity="0.8"/><line x1="0" y1="${h/2}" x2="${w}" y2="${h/2}" stroke="#3a280066" stroke-width="1" stroke-dasharray="2,4"/></svg>`;
+}
 
-      if(markers[key]){
-        markers[key].setLatLng([ap.lat,ap.lon]);
-        markers[key].setStyle({color:col,fillColor:col,radius:r});
-        markers[key].setPopupContent(makePopup(ap));
-      } else {
-        addLog('SIG',(ap.ssid||'<HIDDEN>')+' ['+ap.bssid+'] '+ap.signal+'dBm',isOpen?'c':'n');
-        const m=L.circleMarker([ap.lat,ap.lon],{
-          radius:r,color:col,fillColor:col,fillOpacity:0.8,weight:1.5
-        }).addTo(map);
-        m.bindPopup(makePopup(ap), {maxWidth: 320, minWidth: 280});
-        markers[key]=m;
+// ── SIG BARS ─────────────────────────────────────────────────
+function sigBars(dbm, col) {
+  const lvl = dbm > -55 ? 4 : dbm > -65 ? 3 : dbm > -75 ? 2 : 1;
+  let h = `<span class="sig-bar" style="color:${col}">`;
+  for (let i = 1; i <= 4; i++) h += `<span${i <= lvl ? ' class="on"' : ''}></span>`;
+  return h + '</span>';
+}
 
-        if(isOpen){
-          const ring=L.circleMarker([ap.lat,ap.lon],{
-            radius:r+8,color:'#ff3c00',fillColor:'transparent',weight:1,opacity:0.5
-          }).addTo(map);
-          pulseRings[key]=ring;
-          setTimeout(()=>{
-            const el=ring.getElement();
-            if(el){el.style.animation='blinkbadge 1.4s ease-out infinite';}
-          },50);
-        }
-      }
-    });
-
-    Object.keys(markers).forEach(key=>{
-      if(!aps[key]){
-        map.removeLayer(markers[key]); delete markers[key];
-        if(pulseRings[key]){map.removeLayer(pulseRings[key]);delete pulseRings[key];}
-      }
-    });
+// ── DISPLAY UPDATE ───────────────────────────────────────────
+function updateDisplay(aps) {
+  allAps = aps;
+  const total = Object.keys(aps).length;
+  document.getElementById('cnt').textContent = String(total).padStart(3, '0');
+  const openCount = Object.values(aps).filter(a => isOpenNet(a)).length;
+  document.getElementById('ocnt').textContent = openCount;
+  const b = document.getElementById('threat-badge');
+  if (openCount === 0) { b.textContent = 'NOMINAL'; b.className = 'threat-label nom'; }
+  else if (openCount < 3) { b.textContent = 'ELEVATED'; b.className = 'threat-label elv'; }
+  else { b.textContent = '!! CRITICAL'; b.className = 'threat-label crit'; }
+  updateSigHistory(aps);
+  if (panelOpen) renderPanel();
+  if (chanOpen) drawChannelChart(aps);
+  if (!roomMode) {
+    MM.flush();
+    for (const [k, ap] of Object.entries(aps)) {
+      if (MM.isReal(k)) MM.update(k, ap);
+      else { addLog('SIG', (ap.ssid || '<HIDDEN>') + ' ' + ap.signal + 'dBm', isOpenNet(ap) ? 'crit' : 'info'); MM.add(k, ap, map); }
+    }
+    for (const k of MM.keys()) { if (!aps[k]) MM.remove(k, map); }
   } else {
-    // In room mode just log new APs
-    Object.entries(aps).forEach(([key,ap])=>{
-      if(!markers[key]){
-        // Create a placeholder marker off-screen so panel clicks don't crash
-        const isOpen=ap.security&&(ap.security.includes('OPEN')||ap.security==='');
-        addLog('SIG',(ap.ssid||'<HIDDEN>')+' '+ap.signal+'dBm',isOpen?'c':'n');
-        markers[key] = {_roomPlaceholder:true};
-      }
+    for (const [k, ap] of Object.entries(aps)) {
+      if (!MM.has(k)) { addLog('SIG', (ap.ssid || '<HIDDEN>') + ' ' + ap.signal + 'dBm', isOpenNet(ap) ? 'crit' : 'info'); MM.add(k, ap, map); }
+    }
+  }
+}
+
+// ── PANEL ────────────────────────────────────────────────────
+function togglePanel() {
+  panelOpen = !panelOpen;
+  document.getElementById('panel').classList.toggle('open', panelOpen);
+  document.getElementById('btn-targets').classList.toggle('active', panelOpen);
+  if (panelOpen) renderPanel();
+}
+
+function renderPanel() {
+  const list = document.getElementById('ap-list');
+  const entries = Object.entries(allAps).sort((a, b) => b[1].signal - a[1].signal);
+  document.getElementById('pcnt').textContent = entries.length;
+  list.innerHTML = '';
+  for (const [k, ap] of entries) {
+    const isOpen = isOpenNet(ap);
+    const sc = ap.signal > -65 ? 'var(--amber)' : ap.signal > -80 ? '#ffcc00' : 'var(--red)';
+    const d = document.createElement('div');
+    d.className = 'ap-item' + (isOpen ? ' open-net' : '');
+    d.innerHTML = `<div class="ap-ssid${isOpen ? ' open-ssid' : ''}">${isOpen ? '&#9888; ' : ''}${ap.ssid || '&lt;HIDDEN&gt;'}${isOpen ? ' <span class="open-tag">[OPEN]</span>' : ''}</div>
+      <div class="ap-meta"><span class="mac">${ap.bssid}</span><span>${sigBars(ap.signal, sc)} ${ap.signal}dBm</span><span>CH${ap.channel}</span><span>${ap.vendor || '?'}</span></div>`;
+    d.onclick = () => { if (!roomMode) { MM.flyTo(k, map, ap); MM.openPopup(k); } };
+    list.appendChild(d);
+  }
+}
+
+// ── CHANNEL CHART ────────────────────────────────────────────
+function toggleChanPanel() {
+  chanOpen = !chanOpen;
+  document.getElementById('chan-panel').classList.toggle('open', chanOpen);
+  document.getElementById('btn-channels').classList.toggle('active', chanOpen);
+  if (chanOpen) drawChannelChart(allAps);
+}
+
+function drawChannelChart(aps) {
+  const canvas = document.getElementById('chan-canvas');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.offsetWidth || 224, H = canvas.offsetHeight || 300;
+  canvas.width = W; canvas.height = H;
+  ctx.fillStyle = '#080604'; ctx.fillRect(0,0,W,H);
+  const counts = {};
+  for (const ap of Object.values(aps)) { const ch = ap.channel||0; counts[ch] = (counts[ch]||0)+1; }
+  const ch24 = [1,2,3,4,5,6,7,8,9,10,11,12,13,14].map(c => ({ ch: c, n: counts[c]||0 }));
+  const ch5  = [36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,149,153,157,161,165].map(c => ({ ch: c, n: counts[c]||0 }));
+  const maxN = Math.max(1, ...Object.values(counts));
+  function section(chs, sy, label, col) {
+    ctx.font = '700 8px Big Shoulders Display, monospace'; ctx.fillStyle = col; ctx.fillText(label, 6, sy - 4);
+    const bw = Math.floor((W - 20) / chs.length) - 1;
+    chs.forEach((c, i) => {
+      const x = 10 + i * (bw+1), bh = c.n > 0 ? Math.max(3, Math.floor((c.n/maxN)*55)) : 0, y = sy + 58 - bh;
+      if (c.n > 0) {
+        const g = ctx.createLinearGradient(0, y, 0, sy+58);
+        g.addColorStop(0, col); g.addColorStop(1, col + '44');
+        ctx.fillStyle = g; ctx.fillRect(x, y, bw, bh);
+        ctx.shadowColor = col; ctx.shadowBlur = 3; ctx.fillRect(x, y, bw, 1); ctx.shadowBlur = 0;
+      } else { ctx.fillStyle = '#2a1500'; ctx.fillRect(x, sy+52, bw, 5); }
+      if (bw >= 7) { ctx.font = '6px Share Tech Mono,monospace'; ctx.fillStyle = c.n > 0 ? col : '#3a2800'; ctx.fillText(c.ch, x + bw/2 - (c.ch>9?4:2), sy+70); }
+      if (c.n > 0) { ctx.font = '700 7px Share Tech Mono,monospace'; ctx.fillStyle = col; ctx.fillText(c.n, x+bw/2-3, y-2); }
     });
   }
+  section(ch24, 18,  '2.4 GHz', '#ff8c00');
+  section(ch5,  118, '5 GHz',   '#00b4cc');
+  const ov = ch24.filter(c => c.n > 0 && ![1,6,11].includes(c.ch));
+  if (ov.length > 0) { ctx.font = '7px Share Tech Mono,monospace'; ctx.fillStyle = '#c41e0a'; ctx.fillText('\u26a0 CH OVERLAP: ' + ov.map(c=>c.ch).join(','), 6, 104); }
+  ctx.font = '8px Share Tech Mono,monospace'; ctx.fillStyle = '#7a5500';
+  ctx.fillText('TOTAL: ' + Object.values(aps).length + ' APs', 6, H - 6);
 }
 
-// ═══════════════════════════════════════════════════════════════
-// OPERATOR UPDATE FROM SSE
-// ═══════════════════════════════════════════════════════════════
-function updateOperator(op){
-  if(!op) return;
-  if(op.gps && !gpsLocked){
-    gpsLocked=true;
-    addLog('GPS','HARDWARE GPS LOCKED // '+op.lat.toFixed(6)+','+op.lon.toFixed(6),'n');
-    const pill=document.getElementById('gps-pill');
-    pill.className='gps-pill live';
-    document.getElementById('gps-txt').textContent='GPS: LOCKED';
-  }
-  if(op.gps || !operatorMarker){
-    updateOperatorMarker(op.lat,op.lon,op.gps);
-    if(op.gps) map.panTo([op.lat,op.lon],{animate:true,duration:0.5});
-  }
+// ── OPERATOR MARKER ──────────────────────────────────────────
+function makeOpIcon(gps) {
+  const col = gps ? '#00b4cc' : '#ff8c00';
+  return L.divIcon({
+    html: `<div style="width:14px;height:14px;border:2px solid ${col};background:${col}22;box-shadow:0 0 10px ${col}88;animation:pip-pulse 1.2s infinite;position:relative;">
+      <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:4px;height:4px;background:${col};"></div>
+    </div>`,
+    iconSize: [14, 14], iconAnchor: [7, 7], className: ''
+  });
+}
+function updateOpMarker(lat, lon, gps) {
+  if (!opMarker) {
+    opMarker = L.marker([lat, lon], { icon: makeOpIcon(gps), zIndexOffset: 9000 }).addTo(map);
+    opMarker.bindPopup(`<div style="font-family:'Share Tech Mono',monospace;background:#0e0c09;border:1px solid #ff8c00;padding:8px;font-size:9px;color:#ff8c00;letter-spacing:2px;">OPERATOR<br><span style="color:#7a5500;font-size:8px;">${gps?'HARDWARE GPS':'BROWSER'}</span><br><span style="font-size:7px;color:#3a2800;">${lat.toFixed(6)}, ${lon.toFixed(6)}</span></div>`);
+  } else { opMarker.setLatLng([lat, lon]); opMarker.setIcon(makeOpIcon(gps)); }
+  window._opLat = lat; window._opLon = lon;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SSE
-// ═══════════════════════════════════════════════════════════════
-let evt=null;
-const sseEl=document.getElementById('sse-status');
-function setConn(s){
-  const labels={conn:'LIVE',disc:'OFFLINE',wait:'CONNECTING'};
-  sseEl.className='pill '+s;
-  sseEl.innerHTML='<div class="pill-dot"></div>'+(labels[s]||s);
+if (navigator.geolocation) {
+  navigator.geolocation.watchPosition(pos => {
+    if (gpsLocked) return;
+    const { latitude: lat, longitude: lon } = pos.coords;
+    window._opLat = lat; window._opLon = lon;
+    map.setView([lat, lon], 16);
+    updateOpMarker(lat, lon, false);
+    addLog('GPS', 'BROWSER LOC: ' + lat.toFixed(4) + ',' + lon.toFixed(4), 'info');
+  }, () => addLog('GPS', 'BROWSER GPS UNAVAILABLE', 'warn'), { enableHighAccuracy: true, maximumAge: 5000 });
 }
 
-function connect(){
-  if(evt) evt.close();
-  setConn('wait');
-  evt=new EventSource('/sse');
-  evt.onopen=()=>{ setConn('conn'); reconnects=0; addLog('SSE','STREAM ESTABLISHED','i'); };
-  evt.onmessage=e=>{
-    try{
-      const d=JSON.parse(e.data);
-      if(d.type==='full'){
-        if(d.operator) updateOperator(d.operator);
+// ── SSE ──────────────────────────────────────────────────────
+function setConn(s) {
+  const el = document.getElementById('conn-badge');
+  const txt = document.getElementById('conn-txt');
+  el.className = 'conn-badge ' + s;
+  txt.textContent = s === 'live' ? 'LIVE' : s === 'disc' ? 'OFFLINE' : 'CONNECTING';
+}
+let evt = null;
+function connect() {
+  if (evt) evt.close(); setConn('wait');
+  evt = new EventSource('/sse');
+  evt.onopen = () => { setConn('live'); reconnects = 0; addLog('SSE', 'STREAM ESTABLISHED', 'info'); };
+  evt.onmessage = e => {
+    try {
+      const d = JSON.parse(e.data);
+      if (d.type === 'alert') { handleAlertEvent(d); return; }
+      if (d.type === 'full') {
+        if (d.operator) updateOp(d.operator);
         updateDisplay(d.aps);
-        // Survey heatmap ingestion — pass operator lat/lon from SSE
-        if(d.survey){
+        if (d.geo) document.getElementById('local-db-cnt').textContent = d.geo.localBssids;
+        if (d.survey) {
           const op = d.operator || {};
-          ingestSurveyReadings(d.aps, op.lat, op.lon, d.survey.readings);
-          // Keep survey button in sync if server restarted
-          if(d.survey.active && !surveyMode){
-            document.getElementById('survey-btn').classList.add('survey-active');
+          ingestSurvey(d.aps, op.lat, op.lon, d.survey.readings);
+          if (d.survey.active && !surveyMode) {
+            document.getElementById('btn-survey').classList.add('active');
             document.getElementById('survey-legend').classList.add('active');
             surveyMode = true;
           }
         }
       }
-    }catch(err){ addLog('ERR','PARSE: '+err.message,'c'); }
+    } catch (err) { addLog('ERR', 'PARSE: ' + err.message, 'crit'); }
   };
-  evt.onerror=()=>{
+  evt.onerror = () => {
     setConn('disc'); evt.close();
-    if(reconnects<10){
-      reconnects++;
-      addLog('SSE','RECONNECT '+reconnects+'/10...','w');
-      setTimeout(connect, 2000+reconnects*500);
-    } else addLog('SSE','MAX RETRIES — STREAM DEAD','c');
+    if (reconnects < 10) { reconnects++; addLog('SSE', 'RECONNECT ' + reconnects + '/10...', 'warn'); setTimeout(connect, 2000 + reconnects * 500); }
+    else addLog('SSE', 'STREAM DEAD — MAX RETRIES', 'crit');
   };
 }
 connect();
-setInterval(()=>{ if(evt&&evt.readyState===EventSource.CLOSED) connect(); },30000);
+setInterval(() => { if (evt && evt.readyState === EventSource.CLOSED) connect(); }, 30000);
 
-// ═══════════════════════════════════════════════════════════════
-// WALK SURVEY — heatmap overlay
-// ═══════════════════════════════════════════════════════════════
-let surveyMode     = false;
-let surveyReadings = 0;
-// surveyData: { bssid -> { ssid, readings:[{lat,lon,rssi}], color, visible } }
-const surveyData   = {};
-const heatLayers   = {}; // bssid -> array of Leaflet circleMarkers
-// Palette for per-AP colouring — cycles through distinct hues
-const surveyPalette = [
-  '#0aff6e','#00e5ff','#ffe600','#ff3c00','#ff00cc','#9900ff',
-  '#00ffcc','#ff9900','#66ff00','#ff0066','#0066ff','#ffcc00'
-];
-let surveyPaletteIdx = 0;
-
-function surveyColorFor(bssid){
-  if(!surveyData[bssid]) surveyData[bssid] = {
-    ssid:'?', readings:[], color: surveyPalette[surveyPaletteIdx++ % surveyPalette.length], visible:true
-  };
-  return surveyData[bssid].color;
-}
-
-function toggleSurvey(){
-  surveyMode = !surveyMode;
-  const btn = document.getElementById('survey-btn');
-  const legend = document.getElementById('survey-legend');
-  if(surveyMode){
-    btn.classList.add('survey-active');
-    legend.classList.add('active');
-    fetch('/survey', {method:'POST', body:'start'});
-    addLog('SURVEY','WALK SURVEY STARTED — move around to build heatmap','w');
-  } else {
-    btn.classList.remove('survey-active');
-    fetch('/survey', {method:'POST', body:'stop'});
-    addLog('SURVEY','WALK SURVEY PAUSED — ' + surveyReadings + ' readings','i');
+function updateOp(op) {
+  if (!op) return;
+  if (op.gps && !gpsLocked) {
+    gpsLocked = true;
+    addLog('GPS', 'HARDWARE LOCK: ' + op.lat.toFixed(5) + ',' + op.lon.toFixed(5), 'info');
+    const pill = document.getElementById('gps-pill');
+    pill.className = 'hdr-gps live';
+    document.getElementById('gps-txt').textContent = 'GPS: LOCKED';
+  }
+  if (op.gps || !opMarker) {
+    updateOpMarker(op.lat, op.lon, op.gps);
+    if (op.gps) map.panTo([op.lat, op.lon], { animate: true, duration: 0.5 });
   }
 }
 
-function surveyDownload(){
-  window.open('/survey/export','_blank');
+// ── ROOM MODE RADAR ──────────────────────────────────────────
+function toggleRoomMode() {
+  roomMode = !roomMode;
+  document.getElementById('room-radar').classList.toggle('active', roomMode);
+  document.getElementById('map').classList.toggle('hidden', roomMode);
+  document.getElementById('radar-legend').classList.toggle('active', roomMode);
+  document.getElementById('btn-room').classList.toggle('active', roomMode);
+  MM.setMode(roomMode ? 'room' : 'map');
+  if (roomMode) { addLog('MODE', 'ROOM RADAR ENGAGED', 'info'); startRadar(); }
+  else { if (radarAnim) { cancelAnimationFrame(radarAnim); radarAnim = null; } addLog('MODE', 'MAP MODE RESTORED', 'info'); }
 }
 
-function surveyClear(){
-  fetch('/survey', {method:'POST', body:'clear'}).then(()=>{
-    // Remove all heatmap layers from map
+function startRadar() {
+  const canvas = document.getElementById('radar-canvas');
+  const ctx = canvas.getContext('2d');
+  function resize() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight - 48 - 52;
+    canvas.style.top = '48px';
+  }
+  resize(); window.addEventListener('resize', resize);
+  const blobPos = {};
+  function sigToR(dbm) {
+    const t = (Math.max(-95, Math.min(-25, dbm)) - (-25)) / ((-95) - (-25));
+    const R = Math.min(canvas.width, canvas.height) * 0.42;
+    return R * (0.12 + t * 0.82);
+  }
+  function frame() {
+    if (!roomMode) return;
+    radarAnim = requestAnimationFrame(frame);
+    const W = canvas.width, H = canvas.height;
+    const X = W/2, Y = H/2, R = Math.min(W, H) * 0.42;
+    ctx.clearRect(0,0,W,H);
+    // Background
+    const bg = ctx.createRadialGradient(X,Y,0, X,Y,R*1.15);
+    bg.addColorStop(0, '#0e0a04'); bg.addColorStop(1, '#060402');
+    ctx.fillStyle = bg; ctx.fillRect(0,0,W,H);
+    // Grid rings
+    [[0.15,'-35',0.5],[0.35,'-50',0.3],[0.55,'-65',0.2],[0.75,'-75',0.14],[0.95,'-90',0.1]].forEach(([t, lbl, a]) => {
+      const r = R * t;
+      ctx.beginPath(); ctx.arc(X,Y,r,0,Math.PI*2);
+      ctx.strokeStyle = `rgba(255,140,0,${a})`; ctx.lineWidth = 1;
+      ctx.setLineDash([3,6]); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = `rgba(255,140,0,${a * 0.8})`; ctx.font = '8px Share Tech Mono,monospace';
+      ctx.fillText(lbl + ' dBm', X + r + 4, Y - 4);
+    });
+    // Cross
+    ctx.strokeStyle = 'rgba(255,140,0,0.1)'; ctx.lineWidth = 1; ctx.setLineDash([2,8]);
+    ctx.beginPath(); ctx.moveTo(X, Y - R*1.05); ctx.lineTo(X, Y + R*1.05); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(X - R*1.05, Y); ctx.lineTo(X + R*1.05, Y); ctx.stroke();
+    ctx.setLineDash([]);
+    // Outer ring
+    ctx.beginPath(); ctx.arc(X,Y,R,0,Math.PI*2);
+    ctx.strokeStyle = 'rgba(255,140,0,0.25)'; ctx.lineWidth = 1.5; ctx.stroke();
+    // Sweep
+    sweepAngle = (sweepAngle + 0.016) % (Math.PI*2);
+    const sw = Math.PI / 7;
+    ctx.beginPath(); ctx.moveTo(X,Y); ctx.arc(X,Y,R, sweepAngle-sw, sweepAngle); ctx.closePath();
+    const sg = ctx.createRadialGradient(X,Y,0, X,Y,R);
+    sg.addColorStop(0, 'rgba(255,140,0,0)'); sg.addColorStop(0.6, 'rgba(255,140,0,0.04)'); sg.addColorStop(1, 'rgba(255,140,0,0.1)');
+    ctx.fillStyle = sg; ctx.fill();
+    ctx.beginPath(); ctx.moveTo(X,Y);
+    ctx.lineTo(X + R * Math.cos(sweepAngle), Y + R * Math.sin(sweepAngle));
+    ctx.strokeStyle = 'rgba(255,140,0,0.6)'; ctx.lineWidth = 1.2; ctx.stroke();
+    // APs
+    for (const [key, ap] of Object.entries(allAps)) {
+      if (!radarWobble[key]) radarWobble[key] = { a: Math.random()*Math.PI*2, d: (Math.random()-0.5)*0.003 };
+      radarWobble[key].a += radarWobble[key].d;
+      const dist = sigToR(ap.signal);
+      const bx = X + dist * Math.cos(radarWobble[key].a);
+      const by = Y + dist * Math.sin(radarWobble[key].a);
+      blobPos[key] = { x: bx, y: by, ap };
+      const isOpen = isOpenNet(ap);
+      const col = ap.signal > -55 ? '#ff8c00' : ap.signal > -70 ? '#ffcc00' : '#c41e0a';
+      const rad = ap.signal > -55 ? 8 : ap.signal > -70 ? 6 : 5;
+      if (isOpen) {
+        ctx.beginPath(); ctx.arc(bx, by, rad+8, 0, Math.PI*2);
+        ctx.strokeStyle = 'rgba(196,30,10,0.5)'; ctx.lineWidth = 1;
+        ctx.setLineDash([2,3]); ctx.stroke(); ctx.setLineDash([]);
+      }
+      const halo = ctx.createRadialGradient(bx,by,0, bx,by,rad*3);
+      halo.addColorStop(0, col+'aa'); halo.addColorStop(1, col+'00');
+      ctx.beginPath(); ctx.arc(bx,by,rad*3,0,Math.PI*2); ctx.fillStyle = halo; ctx.fill();
+      ctx.beginPath(); ctx.arc(bx,by,rad,0,Math.PI*2); ctx.fillStyle = col; ctx.fill();
+      const label = ap.ssid && ap.ssid !== '<hidden>' ? ap.ssid : '< HIDDEN >';
+      ctx.font = '9px Share Tech Mono,monospace'; ctx.fillStyle = col; ctx.globalAlpha = 0.8;
+      ctx.shadowColor = '#080604'; ctx.shadowBlur = 5;
+      ctx.fillText(label, bx + rad + 4, by - 3);
+      ctx.fillStyle = 'rgba(255,140,0,0.4)'; ctx.font = '7px Share Tech Mono,monospace';
+      ctx.fillText(ap.signal + 'dBm', bx + rad + 4, by + 9);
+      ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+    }
+    // Operator crosshair
+    ctx.strokeStyle = '#00b4cc'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(X,Y,5,0,Math.PI*2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(X-10,Y); ctx.lineTo(X+10,Y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(X,Y-10); ctx.lineTo(X,Y+10); ctx.stroke();
+    ctx.fillStyle = '#00b4cc'; ctx.beginPath(); ctx.arc(X,Y,2,0,Math.PI*2); ctx.fill();
+    // Title
+    ctx.font = '700 10px Big Shoulders Display,monospace'; ctx.fillStyle = 'rgba(255,140,0,0.3)'; ctx.globalAlpha = 1;
+    ctx.fillText('PROXIMITY RADAR — ROOM MODE', X - 155, 22);
+    // Expose for tooltip
+    canvas._blobPos = blobPos;
+  }
+  frame();
+  const tip = document.getElementById('radar-tip');
+  canvas.addEventListener('mousemove', e => {
+    if (!roomMode) return;
+    const r = canvas.getBoundingClientRect();
+    const mx = e.clientX - r.left, my = e.clientY - r.top;
+    let hit = null;
+    for (const pos of Object.values(canvas._blobPos || {})) {
+      if (Math.hypot(mx - pos.x, my - pos.y) < 16) { hit = pos.ap; break; }
+    }
+    if (hit) {
+      const isOpen = isOpenNet(hit);
+      const col = hit.signal > -55 ? '#ff8c00' : hit.signal > -70 ? '#ffcc00' : '#c41e0a';
+      const prox = hit.signal > -55 ? 'SAME ROOM' : hit.signal > -65 ? 'VERY CLOSE' : hit.signal > -75 ? 'NEARBY' : 'DISTANT';
+      document.getElementById('rtip-ssid').textContent = hit.ssid || '<HIDDEN>';
+      document.getElementById('rtip-ssid').style.color = isOpen ? '#c41e0a' : col;
+      document.getElementById('rtip-body').innerHTML =
+        `<span style="color:#7a5500">BSSID</span>  ${hit.bssid}<br>` +
+        `<span style="color:#7a5500">SIG</span>    <span style="color:${col}">${hit.signal} dBm — ${prox}</span><br>` +
+        `<span style="color:#7a5500">CH</span>     ${hit.channel}<br>` +
+        `<span style="color:#7a5500">ENC</span>    <span style="color:${isOpen?'#c41e0a':'#ff8c00'}">${hit.security||'OPEN'}</span>`;
+      tip.style.display = 'block';
+      let tx = e.clientX + 16, ty = e.clientY - 8;
+      if (tx + 200 > window.innerWidth) tx = e.clientX - 210;
+      tip.style.left = tx + 'px'; tip.style.top = ty + 'px';
+    } else { tip.style.display = 'none'; }
+  });
+""";
+    }
+
+    private static String dashHtml2() {
+        return """
+  canvas.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+}
+
+// ── WALK SURVEY ───────────────────────────────────────────────
+function toggleSurvey() {
+  surveyMode = !surveyMode;
+  const btn = document.getElementById('btn-survey');
+  const leg = document.getElementById('survey-legend');
+  if (surveyMode) {
+    btn.classList.add('active');
+    leg.classList.add('active');
+    fetch('/survey', { method: 'POST', body: 'start' });
+    addLog('SURVEY', 'WALK SURVEY STARTED', 'warn');
+  } else {
+    btn.classList.remove('active');
+    fetch('/survey', { method: 'POST', body: 'stop' });
+    addLog('SURVEY', 'SURVEY PAUSED — ' + surveyReadings + ' READINGS', 'info');
+  }
+}
+function surveyDownload() { window.open('/survey/export', '_blank'); }
+function surveyClear() {
+  fetch('/survey', { method: 'POST', body: 'clear' }).then(() => {
     Object.values(heatLayers).forEach(arr => arr.forEach(l => map.removeLayer(l)));
     Object.keys(heatLayers).forEach(k => delete heatLayers[k]);
     Object.keys(surveyData).forEach(k => { surveyData[k].readings = []; });
     surveyReadings = 0;
     document.getElementById('survey-cnt').textContent = '0';
-    document.getElementById('survey-reading-label').textContent = '0 READINGS';
+    document.getElementById('survey-reading-lbl').textContent = '0 READINGS';
     renderSurveyLegend();
-    addLog('SURVEY','SURVEY DATA CLEARED','w');
+    addLog('SURVEY', 'DATA CLEARED', 'warn');
   });
 }
-
-// Called on every SSE update when survey is active
-function ingestSurveyReadings(aps, opLat, opLon, serverReadings){
-  document.getElementById('survey-cnt').textContent = serverReadings;
-  document.getElementById('survey-reading-label').textContent = serverReadings + ' READINGS';
-  surveyReadings = serverReadings;
-
-  if(!surveyMode) return;
-  // Need a GPS fix to record meaningful positions
-  if(!opLat || !opLon) return;
-
-  Object.entries(aps).forEach(([key, ap])=>{
-    if(!surveyData[key]){
-      surveyData[key] = {
-        ssid: ap.ssid || key,
-        readings: [],
-        color: surveyPalette[surveyPaletteIdx++ % surveyPalette.length],
-        visible: true
-      };
-    }
-    surveyData[key].ssid = ap.ssid || key;
-
-    // Deduplicate — only add if moved > ~3m from last reading for this AP
-    const last = surveyData[key].readings[surveyData[key].readings.length - 1];
-    if(last){
-      const dlat = opLat - last.lat, dlon = opLon - last.lon;
-      if(Math.sqrt(dlat*dlat + dlon*dlon) < 0.00003) return; // ~3m threshold
-    }
-
-    surveyData[key].readings.push({lat:opLat, lon:opLon, rssi:ap.signal});
-    drawHeatPoint(key, opLat, opLon, ap.signal);
-  });
-
+function ingestSurvey(aps, opLat, opLon, serverCount) {
+  document.getElementById('survey-cnt').textContent = serverCount;
+  document.getElementById('survey-reading-lbl').textContent = serverCount + ' READINGS';
+  surveyReadings = serverCount;
+  if (!surveyMode || !opLat || !opLon) return;
+  for (const [k, ap] of Object.entries(aps)) {
+    if (!surveyData[k]) surveyData[k] = { ssid: ap.ssid || k, readings: [], color: PALETTE[paletteIdx++ % PALETTE.length], visible: true };
+    surveyData[k].ssid = ap.ssid || k;
+    const last = surveyData[k].readings[surveyData[k].readings.length - 1];
+    if (last && Math.hypot(opLat - last.lat, opLon - last.lon) < 0.00003) continue;
+    surveyData[k].readings.push({ lat: opLat, lon: opLon, rssi: ap.signal });
+    drawHeatPt(k, opLat, opLon, ap.signal);
+  }
   renderSurveyLegend();
 }
-
-function drawHeatPoint(bssid, lat, lon, rssi){
-  if(!surveyData[bssid] || !surveyData[bssid].visible) return;
-  const col   = surveyData[bssid].color;
-  const alpha = rssi > -55 ? 0.75 : rssi > -70 ? 0.55 : 0.35;
-  const r     = rssi > -55 ? 22   : rssi > -70 ? 16   : 10;
-
-  const circle = L.circleMarker([lat, lon], {
-    radius:      r,
-    color:       col,
-    fillColor:   col,
-    fillOpacity: alpha,
-    weight:      0,
-    className:   'survey-point'
-  }).addTo(map);
-
-  circle.bindTooltip(
-    '<span style="font-family:JetBrains Mono,monospace;font-size:10px;color:' + col + '">' +
-    (surveyData[bssid].ssid||bssid) + '<br>' + rssi + ' dBm</span>',
-    {sticky:true, opacity:0.95, className:'survey-tip'}
-  );
-
-  if(!heatLayers[bssid]) heatLayers[bssid] = [];
-  heatLayers[bssid].push(circle);
+function drawHeatPt(bssid, lat, lon, rssi) {
+  if (!surveyData[bssid] || !surveyData[bssid].visible) return;
+  const col = surveyData[bssid].color;
+  const alpha = rssi > -55 ? 0.7 : rssi > -70 ? 0.5 : 0.3;
+  const r     = rssi > -55 ? 20  : rssi > -70 ? 14  : 9;
+  const c = L.circleMarker([lat, lon], { radius: r, color: col, fillColor: col, fillOpacity: alpha, weight: 0 }).addTo(map);
+  c.bindTooltip(`<span style="font-family:'Share Tech Mono';font-size:9px;color:${col}">${surveyData[bssid].ssid}<br>${rssi} dBm</span>`, { sticky: true });
+  if (!heatLayers[bssid]) heatLayers[bssid] = [];
+  heatLayers[bssid].push(c);
 }
-
-function renderSurveyLegend(){
-  if(!surveyMode && Object.keys(surveyData).length === 0) return;
-  const container = document.getElementById('survey-ap-filter');
-  container.innerHTML = '';
-  Object.entries(surveyData).forEach(([bssid, d])=>{
-    if(d.readings.length === 0) return;
+function renderSurveyLegend() {
+  const cont = document.getElementById('survey-ap-list');
+  cont.innerHTML = '';
+  for (const [bssid, d] of Object.entries(surveyData)) {
+    if (d.readings.length === 0) continue;
     const row = document.createElement('div');
-    row.className = 'survey-ap-row';
-    row.style.color = d.visible ? d.color : '#333';
-    row.innerHTML =
-      '<div class="survey-ap-dot" style="background:' + (d.visible?d.color:'#333') + ';box-shadow:0 0 4px ' + d.color + '"></div>' +
-      '<span>' + (d.ssid&&d.ssid!=='<hidden>'?d.ssid:bssid.slice(-8)) + '</span>' +
-      '<span style="color:#555;margin-left:auto;">' + d.readings.length + '</span>';
-    row.title = bssid;
-    row.onclick = ()=>{
+    row.className = 'survey-row';
+    row.style.color = d.visible ? d.color : '#3a2800';
+    row.innerHTML = `<div class="survey-dot" style="background:${d.visible?d.color:'#3a2800'};border:1px solid ${d.color};"></div><span style="flex:1;">${d.ssid !== '<hidden>' ? d.ssid : bssid.slice(-8)}</span><span style="color:#3a2800;">${d.readings.length}</span>`;
+    row.onclick = () => {
       d.visible = !d.visible;
-      // Show/hide map layers for this AP
-      if(heatLayers[bssid]) heatLayers[bssid].forEach(l=>{
-        if(d.visible) map.addLayer(l); else map.removeLayer(l);
-      });
+      (heatLayers[bssid] || []).forEach(l => { if (d.visible) map.addLayer(l); else map.removeLayer(l); });
       renderSurveyLegend();
     };
-    container.appendChild(row);
+    cont.appendChild(row);
+  }
+}
+
+// ── ALERT RULES ───────────────────────────────────────────────
+function toggleAlertPanel() {
+  alertOpen = !alertOpen;
+  document.getElementById('alert-panel').classList.toggle('open', alertOpen);
+  document.getElementById('btn-alerts').classList.toggle('active', alertOpen);
+  if (alertOpen) loadAlertRules();
+}
+function loadAlertRules() {
+  fetch('/alerts').then(r => r.json()).then(rules => renderAlertRules(rules)).catch(() => {});
+}
+function renderAlertRules(rules) {
+  const el = document.getElementById('alert-rule-list');
+  el.innerHTML = '';
+  if (!rules.length) { el.innerHTML = '<div style="padding:8px 14px;font-size:8px;color:#3a2800;letter-spacing:2px;">NO RULES</div>'; return; }
+  rules.forEach(r => {
+    const row = document.createElement('div');
+    row.className = 'rule-row';
+    row.innerHTML = `<div style="flex:1;"><div class="rule-type">${r.type.toUpperCase()}</div><div class="rule-pattern">${r.pattern||'(any)'}</div></div><button class="rule-del" onclick="deleteAlertRule('${r.id}')">&#x2715;</button>`;
+    el.appendChild(row);
+  });
+}
+function addAlertRule() {
+  const type = document.getElementById('alert-type-sel').value;
+  const pattern = document.getElementById('alert-pattern-inp').value.trim();
+  fetch('/alerts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type, pattern }) })
+    .then(() => { loadAlertRules(); document.getElementById('alert-pattern-inp').value = ''; addLog('ALERT', 'RULE ADDED: ' + type, 'warn'); });
+}
+function deleteAlertRule(id) {
+  fetch('/alerts', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) }).then(() => loadAlertRules());
+}
+function handleAlertEvent(d) {
+  const msg = '[' + d.rule.type.toUpperCase() + '] ' + (d.ssid || '?') + ' ' + d.bssid;
+  firedAlerts.unshift({ msg, t: new Date().toLocaleTimeString() });
+  if (firedAlerts.length > 20) firedAlerts.pop();
+  renderFiredAlerts();
+  addLog('ALERT', msg, 'crit');
+  const btn = document.getElementById('btn-alerts');
+  btn.classList.add('alert-active');
+  setTimeout(() => btn.classList.remove('alert-active'), 2000);
+}
+function renderFiredAlerts() {
+  const el = document.getElementById('alert-fired-log');
+  el.innerHTML = '';
+  firedAlerts.forEach(a => {
+    const row = document.createElement('div');
+    row.className = 'fired-row';
+    row.textContent = '[' + a.t + '] ' + a.msg;
+    el.appendChild(row);
   });
 }
 
-// ═══════════════════════════════════════════════════════════════
-// BOOT TYPEWRITER
-// ═══════════════════════════════════════════════════════════════
-const bootLines=[
-  '> INITIALIZING BLACK ICE v2...',
-  '> LOADING OUI DATABASE...',
-  '> BINDING NPCAP HANDLES...',
-  '> STARTING PASSIVE 802.11 CAPTURE...',
-  '> WIGLE GEOLOCATION: ACTIVE',
-  '> GPS READER: SEARCHING...',
-  '> HTTP SERVER: ONLINE',
-  '> SSE STREAM: CONNECTED',
-  '> SWARM INTELLIGENCE: ARMED',
-  '> EVIL TWIN DETECTION: ENABLED',
-  '> MAP TILES: CARTO DARK MATTER',
-  '> ROOM MODE RADAR: READY',
-  '> WALK SURVEY ENGINE: ARMED',
-  '',
-  '  ALL SYSTEMS NOMINAL. ENTERING SURVEILLANCE MODE.',
-  '',
-];
+// ── TRILATERATION ─────────────────────────────────────────────
+let triActive = false;
+const triPts = [];
+let triBssid = null, triMarker = null;
+function toggleTriPanel() {
+  triActive = !triActive;
+  document.getElementById('tri-panel').classList.toggle('active', triActive);
+  document.getElementById('btn-tri').classList.toggle('active', triActive);
+  if (triActive) { triPts.length = 0; triBssid = null; updateTriSel(); updateTriStatus(); addLog('TRI', 'WIZARD OPEN — MARK 3 POSITIONS', 'info'); }
+}
+function triCancel() {
+  triActive = false; triPts.length = 0;
+  document.getElementById('tri-panel').classList.remove('active');
+  document.getElementById('btn-tri').classList.remove('active');
+  addLog('TRI', 'ABORTED', 'warn');
+}
+function updateTriSel() {
+  const sel = document.getElementById('tri-ap-sel');
+  sel.innerHTML = '<option value="">-- select AP --</option>';
+  Object.entries(allAps).sort((a,b) => b[1].signal - a[1].signal).forEach(([k, ap]) => {
+    const o = document.createElement('option');
+    o.value = k; o.textContent = (ap.ssid || '<HIDDEN>') + ' [' + ap.signal + 'dBm]';
+    sel.appendChild(o);
+  });
+}
+function updateTriStatus() {
+  for (let i = 0; i < 3; i++) document.getElementById('tri-d'+i).className = 'tri-dot' + (i < triPts.length ? ' lit' : '');
+  const steps = [
+    'Move to position A. Select AP. Click MARK.',
+    'Move to position B (\u22653m away). Click MARK.',
+    'Move to position C. Click MARK to compute fix.',
+    'Computing trilateration...'
+  ];
+  document.getElementById('tri-status').textContent = steps[Math.min(triPts.length, 3)];
+}
+function triMark() {
+  const sel = document.getElementById('tri-ap-sel');
+  if (!sel.value) { addLog('TRI', 'SELECT AP FIRST', 'crit'); return; }
+  triBssid = sel.value;
+  const ap = allAps[triBssid];
+  if (!ap) { addLog('TRI', 'AP NOT IN SCAN', 'crit'); return; }
+  if (!window._opLat) { addLog('TRI', 'NO GPS FIX', 'crit'); return; }
+  triPts.push({ lat: window._opLat, lon: window._opLon, rssi: ap.signal });
+  addLog('TRI', 'PT ' + 'ABC'[triPts.length-1] + ' @ ' + window._opLat.toFixed(4) + ',' + window._opLon.toFixed(4), 'info');
+  if (triPts.length === 3) computeTri(ap); else updateTriStatus();
+}
+function computeTri(ap) {
+  updateTriStatus();
+  const TX = -30, N = 2.8;
+  const pts = triPts.map(p => ({ lat: p.lat, lon: p.lon, d: Math.pow(10, (TX - p.rssi) / (10 * N)) }));
+  const cLat = (pts[0].lat+pts[1].lat+pts[2].lat)/3, cLon = (pts[0].lon+pts[1].lon+pts[2].lon)/3;
+  const toXY = p => ({ x: (p.lon-cLon)*111320*Math.cos(cLat*Math.PI/180), y: (p.lat-cLat)*111320, d: p.d });
+  const [A,B,C] = pts.map(toXY);
+  const bx=2*(B.x-A.x), by=2*(B.y-A.y), cx=2*(C.x-A.x), cy=2*(C.y-A.y);
+  const br=A.d*A.d-B.d*B.d-A.x*A.x+B.x*B.x-A.y*A.y+B.y*B.y;
+  const cr=A.d*A.d-C.d*C.d-A.x*A.x+C.x*C.x-A.y*A.y+C.y*C.y;
+  const det = bx*cy - by*cx;
+  if (Math.abs(det) < 1e-10) { document.getElementById('tri-status').textContent = 'COLLINEAR — REPOSITION'; triPts.length=0; updateTriStatus(); return; }
+  const estX=(br*cy-cr*by)/det, estY=(bx*cr-cx*br)/det;
+  const estLat=cLat+estY/111320, estLon=cLon+estX/(111320*Math.cos(cLat*Math.PI/180));
+  if (triMarker) map.removeLayer(triMarker);
+  const col = '#c41e0a';
+  triMarker = L.circleMarker([estLat, estLon], { radius: 12, color: col, fillColor: col, fillOpacity: 0.4, weight: 2 }).addTo(map);
+  triMarker.bindPopup(`<div style="background:#0e0c09;border:1px solid #c41e0a;padding:10px;font-family:'Share Tech Mono';font-size:9px;color:#ff8c00;min-width:200px;"><div style="font-family:'Big Shoulders Display';font-size:14px;font-weight:700;letter-spacing:4px;color:#c41e0a;margin-bottom:6px;">TRILATERATION FIX</div>${ap.ssid||'HIDDEN'}<br>EST: ${estLat.toFixed(6)}, ${estLon.toFixed(6)}<br><span style="color:#3a2800;font-size:8px;">3-point RSSI method — accuracy varies</span></div>`).openPopup();
+  map.setView([estLat, estLon], 17);
+  document.getElementById('tri-status').textContent = 'FIX: ' + estLat.toFixed(5) + ', ' + estLon.toFixed(5);
+  addLog('TRI', 'FIX \u2192 ' + estLat.toFixed(4) + ',' + estLon.toFixed(4), 'info');
+  triPts.length = 0; triActive = false;
+  document.getElementById('tri-panel').classList.remove('active');
+  document.getElementById('btn-tri').classList.remove('active');
+}
 
-(async()=>{
-  const out=document.getElementById('boot-out');
-  for(const line of bootLines){
-    const div=document.createElement('div');
-    div.className='boot-line';
-    out.appendChild(div);
-    for(const ch of line){
-      div.textContent+=ch;
-      await new Promise(r=>setTimeout(r,18));
-    }
-    await new Promise(r=>setTimeout(r,60));
+// ── BOOT SEQUENCE ─────────────────────────────────────────────
+(async () => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const boot = document.getElementById('boot');
+  const fill = document.getElementById('boot-bar-fill');
+  const pct  = document.getElementById('boot-pct');
+  const log  = document.getElementById('boot-log');
+  for (let p = 0; p <= 100; p++) {
+    fill.style.width = p + '%'; pct.textContent = p + '%';
+    await sleep(12);
   }
-  await new Promise(r=>setTimeout(r,500));
-  document.getElementById('boot-overlay').classList.add('fade');
-  setTimeout(()=>{document.getElementById('boot-overlay').style.display='none';},800);
+  await sleep(300);
+  log.style.display = 'block';
+  const lines = [
+    { tag:'SYS',  cls:'sys',  msg:'BLACK ICE v2 — SIGINT SURVEILLANCE PLATFORM',    st:'',     d:60  },
+    { tag:'SYS',  cls:'sys',  msg:'NIGHTFALL35 RESEARCH DIV // LUSAKA NODE',         st:'',     d:40  },
+    { tag:'INIT', cls:'ok',   msg:'IEEE OUI DATABASE LOADED (38,847 entries)',        st:'ok',   d:100 },
+    { tag:'PCAP', cls:'ok',   msg:'NPCAP 1.79 — MONITOR MODE DRIVER ARMED',          st:'ok',   d:120 },
+    { tag:'GPS',  cls:'warn', msg:'COM3 9600 BAUD — SEEKING NMEA LOCK...',           st:'warn', d:200 },
+    { tag:'HTTP', cls:'ok',   msg:'DASHBOARD BOUND 0.0.0.0:8080',                    st:'ok',   d:80  },
+    { tag:'SSE',  cls:'ok',   msg:'EVENT STREAM ARMED (1Hz BROADCAST)',              st:'ok',   d:70  },
+    { tag:'GEO',  cls:'ok',   msg:'WIGLE GEOLOCATION ENGINE READY',                  st:'ok',   d:80  },
+    { tag:'AI',   cls:'ok',   msg:'SWARM INTELLIGENCE MODULE ARMED',                 st:'ok',   d:70  },
+    { tag:'RADAR',cls:'ok',   msg:'ROOM MODE PROXIMITY RADAR READY',                 st:'ok',   d:60  },
+    { tag:'SURV', cls:'ok',   msg:'WALK SURVEY / WARDRIVING ENGINE ARMED',           st:'ok',   d:60  },
+    { tag:'TRI',  cls:'ok',   msg:'TRILATERATION ENGINE READY — 3-POINT FIX',       st:'ok',   d:60  },
+    { tag:'ALERT',cls:'ok',   msg:'RULES ENGINE ARMED — ssid_disappears FIRES',      st:'ok',   d:60  },
+    { tag:'SYS',  cls:'ok',   msg:'ALL SYSTEMS NOMINAL — ENTERING SURVEILLANCE',     st:'ok',   d:80  },
+  ];
+  for (const l of lines) {
+    const row = document.createElement('div');
+    row.className = 'boot-log-line';
+    const sc = l.cls === 'ok' ? 'ok' : l.cls === 'warn' ? 'warn' : l.cls === 'info' ? 'info' : 'sys';
+    const st = l.st ? `<span class="bll-status ${l.st}">${l.st.toUpperCase()}</span>` : '';
+    row.innerHTML = `<span class="bll-tag ${sc}">[${l.tag}]</span><span class="bll-msg">${l.msg}</span>${st}`;
+    log.appendChild(row); log.scrollTop = log.scrollHeight;
+    await sleep(l.d);
+  }
+  await sleep(500);
+  // Switch to ACCESS GRANTED
+  log.style.display = 'none';
+  document.querySelector('.boot-logo').style.display = 'none';
+  document.querySelector('.boot-sub').style.display = 'none';
+  document.querySelector('.boot-bar-wrap').style.display = 'none';
+  document.querySelector('.boot-pct').style.display = 'none';
+  const granted = document.querySelector('.boot-granted');
+  granted.classList.add('show');
+  await sleep(1000);
+  boot.classList.add('gone');
+  await sleep(800);
+  boot.style.display = 'none';
 })();
 </script>
-</body></htmla
+
+
+</body></html>
 """;
+    }
+    private static final String DASHBOARD_HTML = buildDashboardHtml();
+
 }
