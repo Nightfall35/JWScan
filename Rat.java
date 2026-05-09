@@ -61,8 +61,8 @@ public class Rat {
     private final CopyOnWriteArrayList<HttpExchange> sseClients = new CopyOnWriteArrayList<>();
 
     private final SwarmAi         ai;
-    private final String          myMac        = "00-15-5D-BF-D7-5A";
-    private       boolean         counterMode  = false;e
+    private final String          myMac        = detectOwnMac();;
+    private       boolean         counterMode  = false;
     private final OuiDatabase     ouiDatabase;
     private final WigleGeolocator geolocator;
     private volatile double operatorLat = -15.3875;
@@ -1042,6 +1042,20 @@ public class Rat {
     // so the final String from buildDashboardHtml() has no size restriction.
     private static String buildDashboardHtml() {
         return dashHtml1() + dashHtml2();
+    }
+
+    private String detectOwnMac() {
+        try {
+            for(java.net.NetworkInterface ni : Collections.list(java.net.NetworkInterface.getNetworkInterfaces())){
+                byte[] mac = ni.getHardwareAddress();
+                if(mac != null && mac.length == 6) {
+                    return String.format("%02X:%02X:%02X:%02X:%02X:%02X",
+                            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+                }
+            }
+        } catch (Exception e) {
+         return "00:00:00:00:00:00";
+        }
     }
 
     private static String dashHtml1() {
