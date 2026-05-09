@@ -62,7 +62,7 @@ public class Rat {
 
     private final SwarmAi         ai;
     private final String          myMac        = "00-15-5D-BF-D7-5A";
-    private       boolean         counterMode  = true;
+    private       boolean         counterMode  = false;e
     private final OuiDatabase     ouiDatabase;
     private final WigleGeolocator geolocator;
     private volatile double operatorLat = -15.3875;
