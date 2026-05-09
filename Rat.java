@@ -145,7 +145,7 @@ public class Rat {
         println(" BLACK ICE v2 — FULL PASSIVE + ACTIVE MODE");
         println("==================================================");
 
-        startHttpServer();
+       new EnterpriseApiServer(this,httpPort).start();
 
         background.submit(() -> {
             try {
