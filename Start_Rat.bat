@@ -21,7 +21,7 @@ echo.
 
 start "" "http://localhost:8080"
 
-javac -encoding UTF-8 -cp "pcap4j-core-1.8.2.jar;pcap4j-packetfactory-static-1.8.2.jar;json-20210307.jar;jna-5.13.0.jar;jna-platform-5.13.0.jar;slf4j-api-1.7.36.jar;slf4j-simple-1.7.36.jar;openpdf-1.3.30.jar" *.java
+java -cp "pcap4j-core-1.8.2.jar;pcap4j-packetfactory-static-1.8.2.jar;json-20210307.jar;jna-5.13.0.jar;jna-platform-5.13.0.jar;slf4j-api-1.7.36.jar;slf4j-simple-1.7.36.jar;openpdf-1.3.30.jar;." Rat 8080
 
 echo.
 echo  Swarm terminated. Press any key to exit...
