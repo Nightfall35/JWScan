@@ -1,8 +1,8 @@
 import java.io.*;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * ChannelHopper — rotates the Wi-Fi adapter through 802.11 channels
@@ -40,7 +40,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * LEGAL NOTE:
  *   Channel hopping is passive — it only listens, never transmits.
- *   Legal in all jurisdictions for authorized monitoring.
+ *   Legal in all jurisdictions for authorized monitoring,helps us avoid problems.
  */
 public class ChannelHopper {
 

@@ -10,11 +10,11 @@ import java.util.*;
 import java.util.concurrent.*;
 
 /**
- * EnterpriseApiServer — drop-in replacement for the inline HTTP server in Rat.java.
+ * EnterpriseApiServer — replacement for the inline HTTP server in Rat.java.
  *
  * ENTERPRISE ADDITIONS for bank / corporate buyers:
  *
- * 1. TOKEN AUTHENTICATION — every endpoint (except /health) requires:
+ * 1. TOKEN AUTHENTICATION — every endpoint (except /health) requires: (still work in progress )
  *      Authorization: Bearer <token>
  *    Tokens are generated on startup and printed to console. Configurable
  *    via api_token.txt in the working directory.
@@ -41,9 +41,7 @@ import java.util.concurrent.*;
  *
  * 5. AUDIT LOG — every authenticated API call is written to api_audit.log.
  *
- * HOW TO INTEGRATE:
- *   Replace startHttpServer() in Rat.java with:
- *       new EnterpriseApiServer(this, httpPort).start();
+
  */
 public class EnterpriseApiServer {
 
