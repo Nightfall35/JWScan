@@ -211,7 +211,9 @@ public class EnterpriseApiServer {
             server.createContext("/api/v1/alerts",  this::handleAlerts);
             server.createContext("/api/v1/export",  this::handleExport);
             server.createContext("/api/v1/survey",  this::handleSurvey);
+            
             server.createContext("/sse",            this::handleSse);
+            server.createContext("/api/v1/report", this::handleReport);
 
             server.setExecutor(Executors.newCachedThreadPool());
             server.start();
@@ -349,6 +351,50 @@ public class EnterpriseApiServer {
         //}
         // Delegate SSE connection to Rat's SSE infrastructure
         rat.registerSseClient(ex);
+    }
+
+    private void handleReport(HttpExchange ex) throws IOException {
+        if (!guard(ex, true)) return;
+
+        // Parse query string: ?site=Bank+HQ&title=Floor+3&operator=Ishmael
+        String query = ex.getRequestURI().getQuery();
+        String site     = queryParam(query, "site",     "Site Survey");
+        String title    = queryParam(query, "title",    "Wireless Security Assessment");
+        String operator = queryParam(query, "operator", "BLACK ICE v2");
+
+        try {
+            PdfReportGenerator gen = new PdfReportGenerator(rat);
+            byte[] pdf = gen.generate(site, title, operator);
+
+            String filename = "blackice_report_"
+                + java.time.LocalDate.now() + ".pdf";
+            ex.getResponseHeaders().set("Content-Type", "application/pdf");
+            ex.getResponseHeaders().set("Content-Disposition",
+                "attachment; filename=\"" + filename + "\"");
+            ex.getResponseHeaders().set("Access-Control-Allow-Origin", allowedOrigin);
+            ex.sendResponseHeaders(200, pdf.length);
+            ex.getResponseBody().write(pdf);
+
+        } catch (Exception e) {
+            rat.println("[API] Report generation failed: " + e.getMessage());
+            sendError(ex, 500, "Report generation failed: " + e.getMessage());
+        } finally {
+            ex.getResponseBody().close();
+        }
+    }
+    // helper method to parse query parameters with defaults
+    private String queryParam(String query, String key, String def) {
+        if (query == null) return def;
+        for (String part : query.split("&")) {
+            String[] kv = part.split("=", 2);
+            if (kv.length == 2 && kv[0].equals(key)) {
+                try {
+                    return java.net.URLDecoder.decode(kv[1],
+                        java.nio.charset.StandardCharsets.UTF_8);
+                } catch (Exception e) { return kv[1]; }
+            }
+        }
+        return def;
     }
 
     public void stop() {
