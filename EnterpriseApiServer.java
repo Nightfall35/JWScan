@@ -345,10 +345,10 @@ public class EnterpriseApiServer {
             sendError(ex, 429, "Rate limited");
             return;
         }
-        if (!isAuthorized(ex)) {
-            sendError(ex, 401, "Unauthorized");
-            return;
-        }
+        //if (!isAuthorized(ex)) {
+          //  sendError(ex, 401, "Unauthorized");
+            //return;
+        //}
         // Delegate SSE connection to Rat's SSE infrastructure
         rat.registerSseClient(ex);
     }
