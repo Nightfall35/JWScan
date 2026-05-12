@@ -520,25 +520,45 @@ public class Rat {
     }
 
     // ── Helper: serialize a single AP to JSON ────────────────────────────────────
-    private String apToJson(AP ap) {
-        String vendor = ouiDatabase.lookup(ap.bssid);
-        if (vendor == null) vendor = getVendorFromBssid(ap.bssid);
-        if (vendor == null) vendor = "unknown";
-        return "{\"ssid\":\""     + jsonEscape(ap.ssid)     + "\","
-             + "\"bssid\":\""    + jsonEscape(ap.bssid)    + "\","
-             + "\"security\":\"" + jsonEscape(ap.security) + "\","
-             + "\"signal\":"     + ap.signal                + ","
-             + "\"channel\":"    + ap.channel               + ","
-             + "\"vendor\":\""   + jsonEscape(vendor)       + "\","
-             + "\"lat\":"        + ap.lat                   + ","
-             + "\"lon\":"        + ap.lon                   + ","
-             + "\"source\":\""   + jsonEscape(ap.source)    + "\","
-             + "\"lastSeen\":"   + ap.lastSeen
-             + "}";
+   private String apToJson(AP ap) {
+    // Detect locally administered (randomised) MAC addresses.
+    // When bit 1 of the first octet is set, the MAC was randomly generated
+    // by the OS — no IEEE OUI exists for it, so vendor lookup is meaningless.
+    String vendor;
+    try {
+        int firstOctet = Integer.parseInt(
+            ap.bssid.substring(0, 2).replace(":", ""), 16);
+        boolean isRandomised = (firstOctet & 0x02) != 0;
+        if (isRandomised) {
+            vendor = "Randomised MAC";
+        } else {
+            vendor = ouiDatabase.lookup(ap.bssid);
+            if (vendor == null) vendor = getVendorFromBssid(ap.bssid);
+            if (vendor == null) vendor = "unknown";
+        }
+    } catch (Exception e) {
+        vendor = "unknown";
     }
+
+    return "{\"ssid\":\""     + jsonEscape(ap.ssid)     + "\","
+         + "\"bssid\":\""    + jsonEscape(ap.bssid)    + "\","
+         + "\"security\":\"" + jsonEscape(ap.security) + "\","
+         + "\"signal\":"     + ap.signal                + ","
+         + "\"channel\":"    + ap.channel               + ","
+         + "\"vendor\":\""   + jsonEscape(vendor)       + "\","
+         + "\"lat\":"        + ap.lat                   + ","
+         + "\"lon\":"        + ap.lon                   + ","
+         + "\"source\":\""   + jsonEscape(ap.source)    + "\","
+         + "\"lastSeen\":"   + ap.lastSeen
+         + "}";
+}
 
     // ── AP event handlers ───────────────────────────────────────────────────────
     public void onAccessPointDiscovered(AP ap) {
+        if(ap.channel == 0 && ap.signal <= 95 && ap.ssid.equalsIgnoreCase("unknown")) {
+            return; // likely a noise spike , ignore it 
+            
+        }
         String id       = !ap.bssid.isEmpty() ? ap.bssid : ap.ssid;
         AP     existing = seenById.get(id);
 
