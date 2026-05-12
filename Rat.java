@@ -1242,6 +1242,11 @@ body { background:var(--bg); color:var(--amber); font-family:'Share Tech Mono',m
   <button class="exp-btn" onclick="window.open('/api/v1/export/kml','_blank')">&#8659; KML</button>
   <button class="exp-btn" onclick="window.open('/api/v1/export/gpx','_blank')">&#8659; GPX</button>
 </div>
+<div id="export-strip">
+  <button class="exp-btn" onclick="window.open('/api/v1/export/kml','_blank')">&#8659; KML</button>
+  <button class="exp-btn" onclick="window.open('/api/v1/export/gpx','_blank')">&#8659; GPX</button>
+  <button class="exp-btn" onclick="generateReport()">&#8659; PDF</button>
+</div>
 <div class="hdr">
   <div class="hdr-brand"><div><div class="hdr-brand-name">BLACK ICE</div><div class="hdr-brand-sub">SIGINT // v2 // NIGHTFALL35</div></div></div>
   <div class="hdr-stat"><div class="hdr-stat-lbl">TARGETS</div><div class="hdr-stat-val" id="cnt">000</div></div>
@@ -1367,6 +1372,19 @@ function updateTriStatus(){for(let i=0;i<3;i++)document.getElementById('tri-d'+i
 function triMark(){const sel=document.getElementById('tri-ap-sel');if(!sel.value){addLog('TRI','SELECT AP FIRST','crit');return;}triBssid=sel.value;const ap=allAps[triBssid];if(!ap){addLog('TRI','AP NOT IN SCAN','crit');return;}if(!window._opLat){addLog('TRI','NO GPS FIX','crit');return;}triPts.push({lat:window._opLat,lon:window._opLon,rssi:ap.signal});addLog('TRI','PT '+'ABC'[triPts.length-1]+' @ '+window._opLat.toFixed(4)+','+window._opLon.toFixed(4),'info');if(triPts.length===3)computeTri(ap);else updateTriStatus();}
 function computeTri(ap){updateTriStatus();const TX=-30,N=2.8;const pts=triPts.map(p=>({lat:p.lat,lon:p.lon,d:Math.pow(10,(TX-p.rssi)/(10*N))}));const cLat=(pts[0].lat+pts[1].lat+pts[2].lat)/3,cLon=(pts[0].lon+pts[1].lon+pts[2].lon)/3;const toXY=p=>({x:(p.lon-cLon)*111320*Math.cos(cLat*Math.PI/180),y:(p.lat-cLat)*111320,d:p.d});const[A,B,C]=pts.map(toXY);const bx=2*(B.x-A.x),by=2*(B.y-A.y),cx=2*(C.x-A.x),cy=2*(C.y-A.y);const br=A.d*A.d-B.d*B.d-A.x*A.x+B.x*B.x-A.y*A.y+B.y*B.y;const cr=A.d*A.d-C.d*C.d-A.x*A.x+C.x*C.x-A.y*A.y+C.y*C.y;const det=bx*cy-by*cx;if(Math.abs(det)<1e-10){document.getElementById('tri-status').textContent='COLLINEAR — REPOSITION';triPts.length=0;updateTriStatus();return;}const estX=(br*cy-cr*by)/det,estY=(bx*cr-cx*br)/det;const estLat=cLat+estY/111320,estLon=cLon+estX/(111320*Math.cos(cLat*Math.PI/180));if(triMarker)map.removeLayer(triMarker);const col='#c41e0a';triMarker=L.circleMarker([estLat,estLon],{radius:12,color:col,fillColor:col,fillOpacity:0.4,weight:2}).addTo(map);triMarker.bindPopup(`<div style="background:#0e0c09;border:1px solid #c41e0a;padding:10px;font-family:'Share Tech Mono';font-size:9px;color:#ff8c00;min-width:200px;"><div style="font-family:'Big Shoulders Display';font-size:14px;font-weight:700;letter-spacing:4px;color:#c41e0a;margin-bottom:6px;">TRILATERATION FIX</div>${ap.ssid||'HIDDEN'}<br>EST: ${estLat.toFixed(6)}, ${estLon.toFixed(6)}<br><span style="color:#3a2800;font-size:8px;">3-point RSSI method — accuracy varies</span></div>`).openPopup();map.setView([estLat,estLon],17);document.getElementById('tri-status').textContent='FIX: '+estLat.toFixed(5)+', '+estLon.toFixed(5);addLog('TRI','FIX \\u2192 '+estLat.toFixed(4)+','+estLon.toFixed(4),'info');triPts.length=0;triActive=false;document.getElementById('tri-panel').classList.remove('active');document.getElementById('btn-tri').classList.remove('active');}
 (async()=>{const sleep=ms=>new Promise(r=>setTimeout(r,ms));const boot=document.getElementById('boot');const fill=document.getElementById('boot-bar-fill');const pct=document.getElementById('boot-pct');const log=document.getElementById('boot-log');for(let p=0;p<=100;p++){fill.style.width=p+'%';pct.textContent=p+'%';await sleep(12);}await sleep(300);log.style.display='block';const lines=[{tag:'SYS',cls:'sys',msg:'BLACK ICE v2 — SIGINT SURVEILLANCE PLATFORM',st:'',d:60},{tag:'SYS',cls:'sys',msg:'NIGHTFALL35 RESEARCH DIV // LUSAKA NODE',st:'',d:40},{tag:'INIT',cls:'ok',msg:'IEEE OUI DATABASE LOADED (38,847 entries)',st:'ok',d:100},{tag:'PCAP',cls:'ok',msg:'NPCAP 1.79 — MONITOR MODE DRIVER ARMED',st:'ok',d:120},{tag:'GPS',cls:'warn',msg:'COM3 9600 BAUD — SEEKING NMEA LOCK...',st:'warn',d:200},{tag:'HTTP',cls:'ok',msg:'ENTERPRISE API SERVER ON PORT 8080',st:'ok',d:80},{tag:'SSE',cls:'ok',msg:'EVENT STREAM ARMED (1Hz BROADCAST)',st:'ok',d:70},{tag:'GEO',cls:'ok',msg:'WIGLE GEOLOCATION ENGINE READY',st:'ok',d:80},{tag:'AI',cls:'ok',msg:'SWARM INTELLIGENCE MODULE ARMED',st:'ok',d:70},{tag:'AUTH',cls:'ok',msg:'BEARER TOKEN AUTH ACTIVE — SEE CONSOLE',st:'ok',d:80},{tag:'RADAR',cls:'ok',msg:'ROOM MODE PROXIMITY RADAR READY',st:'ok',d:60},{tag:'SURV',cls:'ok',msg:'WALK SURVEY / WARDRIVING ENGINE ARMED',st:'ok',d:60},{tag:'TRI',cls:'ok',msg:'TRILATERATION ENGINE READY — 3-POINT FIX',st:'ok',d:60},{tag:'ALERT',cls:'ok',msg:'RULES ENGINE ARMED — ssid_disappears FIRES',st:'ok',d:60},{tag:'SYS',cls:'ok',msg:'ALL SYSTEMS NOMINAL — ENTERING SURVEILLANCE',st:'ok',d:80},];for(const l of lines){const row=document.createElement('div');row.className='boot-log-line';const sc=l.cls==='ok'?'ok':l.cls==='warn'?'warn':l.cls==='info'?'info':'sys';const st=l.st?`<span class="bll-status ${l.st}">${l.st.toUpperCase()}</span>`:'';row.innerHTML=`<span class="bll-tag ${sc}">[${l.tag}]</span><span class="bll-msg">${l.msg}</span>${st}`;log.appendChild(row);log.scrollTop=log.scrollHeight;await sleep(l.d);}await sleep(500);log.style.display='none';document.querySelector('.boot-logo').style.display='none';document.querySelector('.boot-sub').style.display='none';document.querySelector('.boot-bar-wrap').style.display='none';document.querySelector('.boot-pct').style.display='none';const granted=document.querySelector('.boot-granted');granted.classList.add('show');await sleep(1000);boot.classList.add('gone');await sleep(800);boot.style.display='none';})();
+function generateReport() {
+  const site     = prompt('Site name:', 'Bank HQ');
+  if (!site) return;
+  const title    = prompt('Audit title:', 'Wireless Security Assessment');
+  const operator = prompt('Operator name:', 'Ishmael D. Tembo');
+  window.open(
+    '/api/v1/report'
+    + '?site='     + encodeURIComponent(site)
+    + '&title='    + encodeURIComponent(title)
+    + '&operator=' + encodeURIComponent(operator),
+    '_blank'
+  );
+}
 </script></body></html>
 """;
     }
