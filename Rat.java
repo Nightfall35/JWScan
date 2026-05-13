@@ -275,41 +275,24 @@ public class Rat {
         }
     }
 
-    // ── JSON builder — pure serialization, NO side-effects ──────────────────────
     public String buildFullJson() {
-        StringBuilder sb = new StringBuilder(
-            "{\"type\":\"full\",\"operator\":{\"lat\":" + operatorLat + ",\"lon\":" + operatorLon
-            + ",\"gps\":" + gpsActive + "},\"survey\":{\"active\":" + surveyActive
-            + ",\"readings\":" + surveyReadings.get() + "},\"geo\":{\"localBssids\":"
-            + localGeo.size() + "},\"aps\":{");
-        boolean first = true;
-        long    now   = System.currentTimeMillis();
-
-        for (Map.Entry<String, AP> e : seenById.entrySet()) {
-            AP ap = e.getValue();
-            if (now - ap.lastSeen > 3_000_000) continue;
-            if (!first) sb.append(",");
-            first = false;
-
-            String vendor = ouiDatabase.lookup(ap.bssid);
-            if (vendor == null) vendor = "unknown";
-
-            sb.append("\"").append(e.getKey()).append("\":{")
-              .append("\"ssid\":\"").append(jsonEscape(ap.ssid)).append("\",")
-              .append("\"bssid\":\"").append(jsonEscape(ap.bssid)).append("\",")
-              .append("\"security\":\"").append(jsonEscape(ap.security)).append("\",")
-              .append("\"signal\":").append(ap.signal).append(",")
-              .append("\"channel\":").append(ap.channel).append(",")
-              .append("\"vendor\":\"").append(jsonEscape(vendor)).append("\",")
-              .append("\"lat\":").append(ap.lat).append(",")
-              .append("\"lon\":").append(ap.lon).append(",")
-              .append("\"source\":\"").append(jsonEscape(ap.source)).append("\"")
-              .append("}");
-        }
-        sb.append("}}");
-        return sb.toString();
+    StringBuilder sb = new StringBuilder(
+        "{\"type\":\"full\",\"operator\":{\"lat\":" + operatorLat + ",\"lon\":" + operatorLon
+        + ",\"gps\":" + gpsActive + "},\"survey\":{\"active\":" + surveyActive
+        + ",\"readings\":" + surveyReadings.get() + "},\"geo\":{\"localBssids\":"
+        + localGeo.size() + "},\"aps\":{");
+    boolean first = true;
+    long now = System.currentTimeMillis();
+    for (Map.Entry<String, AP> e : seenById.entrySet()) {
+        AP ap = e.getValue();
+        if (now - ap.lastSeen > 3_000_000) continue;
+        if (!first) sb.append(",");
+        first = false;
+        sb.append("\"").append(e.getKey()).append("\":").append(apToJson(ap));
     }
-
+    sb.append("}}");
+    return sb.toString();
+}
     // ═══════════════════════════════════════════════════════════════════════════
     //  PUBLIC API METHODS — required by EnterpriseApiServer (FIX 12)
     // ═══════════════════════════════════════════════════════════════════════════
@@ -524,15 +507,20 @@ public class Rat {
     // by the OS — no IEEE OUI exists for it, so vendor lookup is meaningless.
     String vendor;
     try {
-        int firstOctet = Integer.parseInt(
-            ap.bssid.substring(0, 2).replace(":", ""), 16);
-        boolean isRandomised = (firstOctet & 0x02) != 0;
-        if (isRandomised) {
-            vendor = "Randomised MAC";
-        } else {
-            vendor = ouiDatabase.lookup(ap.bssid);
-            if (vendor == null) vendor = getVendorFromBssid(ap.bssid);
-            if (vendor == null) vendor = "unknown";
+        String clean = ap.bssid.replace(":", "").replace("-","");
+        if(clean.length() >= 2) {
+            int firstByte = Integer.parseInt(clean.substring(0,2),16);
+            if(( firstByte & 0x02) != 0) {
+                vendor = "Randomised Mac";
+
+            }else {
+                vendor = ouiDatabase.lookup(ap.bssid);
+                if(vendor == null) vendor = "unknown";
+
+            }
+        }else {
+            vendor = "unknown";
+
         }
     } catch (Exception e) {
         vendor = "unknown";
@@ -703,7 +691,6 @@ public class Rat {
         scheduler.shutdownNow();
         background.shutdownNow();
         geoExecutor.shutdownNow();
-        if (httpServer != null) httpServer.stop(1);
         println("Swarm offline.");
     }
 
@@ -969,16 +956,6 @@ public class Rat {
         public String  source   = "Unknown";
     }
 
-    private static class WebSocketHandshake {
-        static String accept(String key) {
-            String magic = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-            try {
-                java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-1");
-                byte[] digest = md.digest(magic.getBytes(StandardCharsets.UTF_8));
-                return java.util.Base64.getEncoder().encodeToString(digest);
-            } catch (Exception e) { return ""; }
-        }
-    }
 
     // ── Dashboard HTML ───────────────────────────────────────────────────────────
     private static String buildDashboardHtml() {
