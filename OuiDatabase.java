@@ -72,7 +72,7 @@ public class OuiDatabase {
 
         String clean = bssid.replace(":", "").replace("-", "").toUpperCase();
         if (clean.length() >= 6) {
-            String v = ouiMap.get(clean.substring(0, 6));
+            String v = db.get(clean.substring(0, 6));
             if (v != null) return v;
         }
     } catch (Exception e) {
