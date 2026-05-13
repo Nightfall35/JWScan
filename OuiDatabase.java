@@ -62,19 +62,11 @@ public class OuiDatabase {
     public String lookup(String bssid) {
     if (bssid == null || bssid.isEmpty()) return null;
     try {
-        // Check if MAC is locally administered (randomised)
-        // Second bit of first octet set = randomly generated MAC
-        String firstOctet = bssid.replace(":", "").replace("-", "").substring(0, 2);
-        int firstByte = Integer.parseInt(firstOctet, 16);
-        if ((firstByte & 0x02) != 0) {
-            return "Randomised MAC";
-        }
-
-        String clean = bssid.replace(":", "").replace("-", "").toUpperCase();
-        if (clean.length() >= 6) {
-            String v = db.get(clean.substring(0, 6));
-            if (v != null) return v;
-        }
+        String clean = normalise(bssid);
+        if(clean == null) return null;
+        int firstByte = Integer.parseInt(clean.substring(0,2), 16);
+        if((firstByte & 0x02) != 0) return "Randomised MAC";
+        return db.get(clean);
     } catch (Exception e) {
         rat.println("OUI lookup error for " + bssid + ": " + e.getMessage());
     }
@@ -670,8 +662,8 @@ public class OuiDatabase {
         for (String[] e : entries) {
             // Clean up any spaces that crept into OUI strings
             String oui = e[0].replace(" ","").toUpperCase();
-            if (oui.length() >= 6) {
-                db.put(oui.substring(0, 6), e[1]);
+            if (oui.length() ==6) {
+                db.put(oui,e[1]);
                 count++;
             }
         }
