@@ -159,7 +159,6 @@ public class Rat {
         println("==================================================");
         println("[API] Own MAC detected as: " + myMac);
 
-        // FIX 11: Use EnterpriseApiServer instead of inline startHttpServer()
         new EnterpriseApiServer(this, httpPort).start();
 
         background.submit(() -> {
@@ -293,7 +292,6 @@ public class Rat {
             first = false;
 
             String vendor = ouiDatabase.lookup(ap.bssid);
-            if (vendor == null) vendor = getVendorFromBssid(ap.bssid);
             if (vendor == null) vendor = "unknown";
 
             sb.append("\"").append(e.getKey()).append("\":{")
