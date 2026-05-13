@@ -555,7 +555,7 @@ public class Rat {
 
     // ── AP event handlers ───────────────────────────────────────────────────────
     public void onAccessPointDiscovered(AP ap) {
-        if(ap.channel == 0 && ap.signal <= 95 && ap.ssid.equalsIgnoreCase("unknown")) {
+        if(ap.channel == 0 && ap.signal <= -95 && ap.ssid.equals("<unknown>")) {
             return; // likely a noise spike , ignore it 
             
         }
@@ -1258,10 +1258,7 @@ body { background:var(--bg); color:var(--amber); font-family:'Share Tech Mono',m
     </div>
   </div>
 </div>
-<div id="export-strip">
-  <button class="exp-btn" onclick="window.open('/api/v1/export/kml','_blank')">&#8659; KML</button>
-  <button class="exp-btn" onclick="window.open('/api/v1/export/gpx','_blank')">&#8659; GPX</button>
-</div>
+
 <div id="export-strip">
   <button class="exp-btn" onclick="window.open('/api/v1/export/kml','_blank')">&#8659; KML</button>
   <button class="exp-btn" onclick="window.open('/api/v1/export/gpx','_blank')">&#8659; GPX</button>
