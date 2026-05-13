@@ -60,12 +60,26 @@ public class OuiDatabase {
      * Returns null if not found (caller should fall back to "unknown").
      */
     public String lookup(String bssid) {
-        if (bssid == null || bssid.isEmpty()) return null;
-        String oui = normalise(bssid);
-        if (oui == null) return null;
-        return db.get(oui);
-    }
+    if (bssid == null || bssid.isEmpty()) return null;
+    try {
+        // Check if MAC is locally administered (randomised)
+        // Second bit of first octet set = randomly generated MAC
+        String firstOctet = bssid.replace(":", "").replace("-", "").substring(0, 2);
+        int firstByte = Integer.parseInt(firstOctet, 16);
+        if ((firstByte & 0x02) != 0) {
+            return "Randomised MAC";
+        }
 
+        String clean = bssid.replace(":", "").replace("-", "").toUpperCase();
+        if (clean.length() >= 6) {
+            String v = ouiMap.get(clean.substring(0, 6));
+            if (v != null) return v;
+        }
+    } catch (Exception e) {
+        rat.println("OUI lookup error for " + bssid + ": " + e.getMessage());
+    }
+    return null;
+}
     /** Total number of OUI entries currently loaded. */
     public int getEntryCount() { return entryCount.get(); }
 
