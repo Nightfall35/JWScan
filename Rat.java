@@ -63,7 +63,7 @@ public class Rat {
     private HttpServer     httpServer;
     private Deauther       deauther    = null;
 
-    private final Map<String, String>                ouiMap     = new ConcurrentHashMap<>();
+
     private final CopyOnWriteArrayList<HttpExchange> sseClients = new CopyOnWriteArrayList<>();
 
     private final SwarmAi         ai;
@@ -887,54 +887,6 @@ public class Rat {
     public String timestamp()                { return "[" + LocalDateTime.now().format(dtf) + "]"; }
     public void soundBell()                  { System.out.print("\007"); System.out.flush(); }
 
-    // ── OUI / vendor lookup ─────────────────────────────────────────────────────
-    private void loadBuiltInOuIs() {
-        String[][] entries = {
-            {"001122","Cisco"},       {"44650D","Cisco Meraki"}, {"A4C3F0","Apple"},
-            {"7C9EBD","TP-Link"},     {"001C10","Ubiquiti"},     {"B827EB","Raspberry Pi"},
-            {"F4F5D8","Google"},      {"9CADEF","Huawei"},       {"B0487A","TP-Link"},
-            {"D85DFB","Amazon"},      {"EC086B","TP-Link"},      {"F81A67","ARRIS"},
-            {"8C8590","Apple"},       {"001D0F","Netgear"},      {"001E2A","Netgear"},
-            {"0021B9","Intel"},       {"0022FA","D-Link"},       {"0050F2","Microsoft"},
-            {"0090CC","Intel"},       {"00E075","Asus"},         {"08D40C","Apple"},
-            {"0C8268","TP-Link"},     {"14CC20","TP-Link"},      {"18A6F7","TP-Link"},
-            {"1C60DE","Asus"},        {"203706","Cisco"},        {"289EDF","Huawei"},
-            {"2CBE08","Apple"},       {"34159E","Raspberry Pi"}, {"34E894","Intel"},
-            {"3C5AB4","Google"},      {"40D32D","Apple"},        {"44D9E7","Ubiquiti"},
-            {"4C32D9","Asus"},        {"5057A8","Cisco"},        {"5C8576","Asus"},
-            {"60A44C","Asus"},        {"647002","TP-Link"},      {"68FF7B","TP-Link"},
-            {"7038EE","Apple"},       {"746A89","TP-Link"},      {"7831C1","Apple"},
-            {"7C0191","Apple"},       {"80D21D","AzureWave"},    {"841B5E","Netgear"},
-            {"84A6C8","Intel"},       {"88DC96","Apple"},        {"8C85C1","Apple"},
-            {"9094E4","D-Link"},      {"94DBDA","Huawei"},       {"9CA513","Samsung"},
-            {"A46706","Apple"},       {"AC293A","Apple"},        {"B0754D","Apple"},
-            {"B8E856","Apple"},       {"C05627","Belkin"},       {"C83A35","TP-Link"},
-            {"CCB255","D-Link"},      {"D0C5D8","AzureWave"},    {"D481CA","Intel"},
-            {"E0CB1D","Belkin"},      {"E4CE70","Huawei"},       {"EC9327","TP-Link"},
-            {"F48C50","Intel"},       {"FC626E","Xiaomi"},       {"50C7BF","TP-Link"},
-            {"000CF1","Samsung"},     {"0017F2","Apple"},        {"00176C","Samsung"},
-            {"001788","Apple"},       {"ACBC32","Apple"},        {"D83462","TP-Link"},
-            {"C4E984","TP-Link"},     {"A42BB0","TP-Link"},      {"307C20","TP-Link"},
-            {"5001BB","Netgear"},     {"C04A00","Netgear"},      {"20E52A","Netgear"},
-            {"000F86","Netgear"},     {"30B5C2","Netgear"},      {"9C3426","Netgear"},
-            {"001B11","D-Link"},      {"00155F","D-Link"},       {"1C7EE5","D-Link"},
-            {"84C9B2","D-Link"},      {"B8A386","D-Link"},       {"00265A","D-Link"},
-            {"C8D3FF","Huawei"},      {"2C9D1E","Huawei"},       {"001E10","Huawei"},
-            {"286ED4","Huawei"},      {"3C47C9","Huawei"},       {"70723C","Huawei"},
-            {"000C29","VMware"},      {"005056","VMware"},       {"000569","VMware"},
-            {"001C14","VMware"},      {"00505A","3Com"},         {"000ABF","3Com"},
-            {"5CE0C5","Asus"},        {"10BF48","Asus"},         {"107B44","Asus"},
-            {"2C56DC","Asus"},        {"50465D","Asus"},         {"BC9780","Asus"},
-            {"001AA0","Ubiquiti"},    {"0418D6","Ubiquiti"},     {"246895","Ubiquiti"},
-            {"68D79A","Ubiquiti"},    {"802AA8","Ubiquiti"},
-            {"009963","Cisco"},       {"001BD4","Cisco"},        {"0026CB","Cisco"},
-            {"04C5A4","Cisco"},       {"1C6A7A","Cisco"},        {"2CF8D8","Cisco"},
-            {"38EDD1","Cisco"},       {"A073C4","Cisco"},        {"C84031","Cisco"},
-            {"F44E73","Cisco"},       {"000414","Cisco"},        {"000562","Cisco"},
-        };
-        for (String[] e : entries) ouiMap.put(e[0], e[1]);
-        println("[OUI] " + ouiMap.size() + " built-in entries loaded");
-    }
 
     private void downloadAndCacheIeeeOui() {
         try {
