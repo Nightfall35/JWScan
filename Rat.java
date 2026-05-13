@@ -120,7 +120,7 @@ public class Rat {
         this.ouiDatabase = new OuiDatabase(this);
         this.geolocator  = new WigleGeolocator(this);
 
-        loadBuiltInOuIs();
+       
         background.submit(this::downloadAndCacheIeeeOui);
         ai = new SwarmAi(this);
 
@@ -956,11 +956,7 @@ public class Rat {
     }
 
     private String getVendorFromBssid(String bssid) {
-        if (bssid == null) return null;
-        String v = ouiDatabase.lookup(bssid);
-        if (v != null) return v;
-        String c = bssid.replace(":", "").replace("-", "").toUpperCase();
-        return c.length() >= 6 ? ouiMap.get(c.substring(0, 6)) : null;
+        return ouiDatabase.lookup(bssid);
     }
 
     // ── Deauther ────────────────────────────────────────────────────────────────
