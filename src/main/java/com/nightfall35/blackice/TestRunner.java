@@ -7,6 +7,8 @@
  *   javac -cp "...jars..." TestRunner.java
  *   java  -cp "...jars...;." TestRunner
  */
+package com.nightfall35.blackice;
+
 public class TestRunner {
 
     static int passed = 0, failed = 0;

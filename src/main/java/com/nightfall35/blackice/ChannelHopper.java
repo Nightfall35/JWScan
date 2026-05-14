@@ -1,3 +1,5 @@
+package com.nightfall35.blackice;
+
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.util.ArrayList;

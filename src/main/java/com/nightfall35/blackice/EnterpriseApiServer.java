@@ -1,3 +1,5 @@
+package com.nightfall35.blackice;
+
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintWriter;

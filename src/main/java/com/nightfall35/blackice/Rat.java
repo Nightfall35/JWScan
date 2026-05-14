@@ -35,6 +35,7 @@
  *        - exportGpx()          — byte[] of GPX (delegates to buildGpx())
  *        - registerSseClient()  — add an authenticated HttpExchange to sseClients
  */
+package com.nightfall35.blackice;
 
 import java.io.BufferedReader;
 import java.io.FileWriter;

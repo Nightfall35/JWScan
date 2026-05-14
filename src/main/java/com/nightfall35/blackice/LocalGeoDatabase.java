@@ -33,6 +33,7 @@
  *
  * Author: Ishmael D. Tembo (NIGHTFALL35)
  */
+package com.nightfall35.blackice;
 
 import java.io.BufferedReader;
 import java.io.IOException;

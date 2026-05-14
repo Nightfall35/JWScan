@@ -1,3 +1,5 @@
+package com.nightfall35.blackice;
+
 import java.awt.Color;
 import java.io.ByteArrayOutputStream;
 import java.time.LocalDateTime;

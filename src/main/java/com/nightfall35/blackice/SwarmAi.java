@@ -1,3 +1,5 @@
+package com.nightfall35.blackice;
+
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
