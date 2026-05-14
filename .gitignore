@@ -4,7 +4,9 @@ gps_port.txt
 
 # ── Cache files ──
 wigle_cache.dat
+wigle_cache.txt
 oui_cache.dat
+oui_cache.txt
 
 # ── Java compiled output ──
 *.class
@@ -17,3 +19,6 @@ oui_cache.dat
 # ── OS junk ──
 Thumbs.db
 .DS_Store
+
+# Maven Target folder .class target file
+target/
