@@ -541,7 +541,7 @@ public class Rat {
 
     // ── AP event handlers ───────────────────────────────────────────────────────
     public void onAccessPointDiscovered(AP ap) {
-        if(ap.channel == 0 && ap.signal <= -95 && ap.ssid.equals("<unknown>")) {
+        if(ap.channel == 0 && ap.signal <= -95 && ap.ssid.equals("<hidden>")) {
             return; // likely a noise spike , ignore it 
             
         }
