@@ -7,6 +7,8 @@ wigle_cache.dat
 wigle_cache.txt
 oui_cache.dat
 oui_cache.txt
+api_audit.log
+api_token.txt
 
 # ── Java compiled output ──
 *.class
