@@ -7,19 +7,15 @@ import java.util.concurrent.*;
  * PassiveScanner — 802.11 frame capture via Npcap/pcap4j.
  *
  * FIXES APPLIED:
- * 1. Radiotap signal extraction now walks field offsets properly
- *    instead of scanning for a 0x0B byte (which is fragile and wrong).
- * 2. Security classification extended: WPA (TKIP-only) distinguished
- *    from WPA2/WPA3 (CCMP), and WPS presence flagged.
- * 3. SSID byte validation added — malformed beacon SSIDs are rejected
- *    rather than forwarded as garbled strings.
- * 4. parseDeauth() correctly maps src/dst from 802.11 address fields
- *    (addr2=transmitter=attacker, addr1=receiver=victim).
- * 5. captureLoop() exception now logged; handle.loop() errors no longer
- *    silently swallow the cause.
- * 6. Adapter filter now accepts Microsoft WiFi Direct adapters (common
- *    on Windows 11) and any interface with a non-empty description
- *    containing "802" (broad fallback for unusual Npcap adapter names).
+ * 1. Radiotap signal extraction now walks field offsets properly.
+ * 2. Security classification extended: WPA/WPA2/WPA3/TKIP/WPS.
+ * 3. SSID byte validation added.
+ * 4. parseDeauth() correctly maps src/dst from 802.11 address fields.
+ * 5. captureLoop() exception now logged with cause.
+ * 6. Adapter filter accepts Microsoft WiFi Direct adapters.
+ * 7. ChannelHopper wired in — started after handles open, stopped in stop().
+ *    Channels are marked active every time a beacon is parsed so the smart
+ *    hopper weights dwell time toward channels with real APs.
  */
 public class PassiveScanner implements AutoCloseable {
 
@@ -27,6 +23,9 @@ public class PassiveScanner implements AutoCloseable {
     private final List<PcapHandle> handles = new ArrayList<>();
     private final ExecutorService pool = Executors.newCachedThreadPool();
     private volatile boolean running = false;
+
+    // ── CHANGE 1: hopper field ───────────────────────────────────────────────
+    private ChannelHopper hopper = null;
 
     public PassiveScanner(Rat rat) {
         this.rat = rat;
@@ -62,9 +61,60 @@ public class PassiveScanner implements AutoCloseable {
                 rat.println("[SCANNER] Failed to open " + nif.getName() + " → " + e.getMessage());
             }
         }
+
+        // ── CHANGE 2: Start channel hopper on first interface ────────────────
+        if (!ifaces.isEmpty()) {
+            try {
+                int     dwellMs  = readHopperConfig("dwell_ms",   150);
+                boolean inc5GHz  = readHopperConfig("band_5ghz",    1) == 1;
+                boolean inc6GHz  = readHopperConfig("band_6ghz",    0) == 1;
+                String  stratStr = readHopperConfigStr("strategy", "SMART");
+
+                hopper = new ChannelHopper(rat, ifaces.get(0).getName(),
+                        dwellMs, inc5GHz, inc6GHz)
+                        .withStrategy(ChannelHopper.Strategy.valueOf(stratStr));
+                hopper.start();
+            } catch (Exception e) {
+                rat.println("[HOPPER] Could not start channel hopper: " + e.getMessage());
+                hopper = null;
+            }
+        }
     }
 
-    // ── FIX 6: Broader interface filter ─────────────────────────────────────
+    // ── Hopper config readers ────────────────────────────────────────────────
+    private int readHopperConfig(String key, int defaultValue) {
+        try {
+            java.nio.file.Path f = java.nio.file.Paths.get("hopper_config.txt");
+            if (!java.nio.file.Files.exists(f)) return defaultValue;
+            for (String line : java.nio.file.Files.readAllLines(f)) {
+                line = line.trim();
+                if (line.startsWith("#") || line.isEmpty()) continue;
+                String[] parts = line.split("=", 2);
+                if (parts.length == 2 && parts[0].trim().equals(key)) {
+                    return Integer.parseInt(parts[1].trim());
+                }
+            }
+        } catch (Exception ignored) {}
+        return defaultValue;
+    }
+
+    private String readHopperConfigStr(String key, String defaultValue) {
+        try {
+            java.nio.file.Path f = java.nio.file.Paths.get("hopper_config.txt");
+            if (!java.nio.file.Files.exists(f)) return defaultValue;
+            for (String line : java.nio.file.Files.readAllLines(f)) {
+                line = line.trim();
+                if (line.startsWith("#") || line.isEmpty()) continue;
+                String[] parts = line.split("=", 2);
+                if (parts.length == 2 && parts[0].trim().equals(key)) {
+                    return parts[1].trim().toUpperCase();
+                }
+            }
+        } catch (Exception ignored) {}
+        return defaultValue;
+    }
+
+    // ── Interface filter ─────────────────────────────────────────────────────
     private List<PcapNetworkInterface> getWifiInterfaces() {
         List<PcapNetworkInterface> list = new ArrayList<>();
         try {
@@ -90,7 +140,7 @@ public class PassiveScanner implements AutoCloseable {
         return list;
     }
 
-    // ── FIX 5: Log exception cause ───────────────────────────────────────────
+    // ── Capture loop ─────────────────────────────────────────────────────────
     private void captureLoop(PcapHandle handle, String ifName) {
         try {
             handle.loop(-1, (PacketListener) packet -> {
@@ -98,7 +148,6 @@ public class PassiveScanner implements AutoCloseable {
 
                 RadiotapPacket radiotap = packet.get(RadiotapPacket.class);
 
-                // Walk to the deepest (raw 802.11) payload
                 Packet payload = packet;
                 while (payload.getPayload() != null) payload = payload.getPayload();
                 if (!(payload instanceof UnknownPacket)) return;
@@ -112,12 +161,12 @@ public class PassiveScanner implements AutoCloseable {
                 int type    = (fc >> 2) & 0x3;
                 int subtype = (fc >> 4) & 0xF;
 
-                if (type != 0) return; // management frames only
+                if (type != 0) return;
 
                 switch (subtype) {
-                    case 8, 5 -> parseBeacon(raw80211, signalDbm);    // Beacon / Probe Response
-                    case 4    -> parseProbeReq(raw80211);               // Probe Request
-                    case 12   -> parseDeauth(raw80211);                 // Deauthentication
+                    case 8, 5 -> parseBeacon(raw80211, signalDbm);
+                    case 4    -> parseProbeReq(raw80211);
+                    case 12   -> parseDeauth(raw80211);
                 }
             });
         } catch (Exception e) {
@@ -127,39 +176,27 @@ public class PassiveScanner implements AutoCloseable {
         }
     }
 
-    // ── FIX 1: Proper radiotap field-offset walking ──────────────────────────
-    /**
-     * Walks the radiotap header present-bitmap and computes the byte offset
-     * of each present field. The DBM_ANTSIGNAL field (bit 5) is then read
-     * at the correct offset, not by scanning for a magic byte.
-     *
-     * Radiotap spec: https://www.radiotap.org/
-     */
+    // ── Radiotap signal extraction ────────────────────────────────────────────
     private int extractSignal(RadiotapPacket radiotap) {
         if (radiotap == null) return -95;
 
         byte[] rt = radiotap.getRawData();
         if (rt.length < 8) return -95;
 
-        // Bytes 4-7: present flags (little-endian)
         int present = (rt[4] & 0xFF)
                 | ((rt[5] & 0xFF) << 8)
                 | ((rt[6] & 0xFF) << 16)
                 | ((rt[7] & 0xFF) << 24);
 
-        // Field sizes and alignment requirements per radiotap spec
-        // index = bit number in present flags
         int[] fieldSizes  = {8, 1, 1, 1, 2, 2, 2, 2, 2, 1, 1, 1, 2, 1};
         int[] fieldAligns = {1, 1, 1, 1, 2, 2, 2, 2, 2, 1, 1, 1, 2, 1};
-        // Bit 5 = DBM_ANTSIGNAL
         int DBM_ANT_SIGNAL_BIT = 5;
 
-        int offset = 8; // start after the 8-byte header
+        int offset = 8;
         for (int bit = 0; bit < 32; bit++) {
             if ((present & (1 << bit)) == 0) continue;
             if (bit >= fieldSizes.length) break;
 
-            // Align offset to field's required boundary
             int align = fieldAligns[bit];
             if (align > 1 && offset % align != 0) {
                 offset += align - (offset % align);
@@ -168,7 +205,6 @@ public class PassiveScanner implements AutoCloseable {
             if (bit == DBM_ANT_SIGNAL_BIT) {
                 if (offset < rt.length) {
                     int raw = rt[offset] & 0xFF;
-                    // Values > 127 are negative (two's complement for int8)
                     return raw > 127 ? raw - 256 : raw;
                 }
                 break;
@@ -178,17 +214,17 @@ public class PassiveScanner implements AutoCloseable {
         return -95;
     }
 
-    // ── FIX 2+3: Improved security classification, SSID validation ──────────
+    // ── Beacon / Probe Response parser ────────────────────────────────────────
     private void parseBeacon(byte[] raw, int signalDbm) {
         Rat.AP ap = new Rat.AP();
-        ap.bssid = formatMac(raw, 10);
+        ap.bssid  = formatMac(raw, 10);
         ap.signal = signalDbm;
 
-        boolean hasRsn   = false; // IE 48 = RSN (WPA2/WPA3)
-        boolean hasWpa   = false; // IE 221 vendor = WPA
-        boolean hasCcmp  = false;
-        boolean hasTkip  = false;
-        boolean hasWps   = false; // IE 221 with WPS OUI
+        boolean hasRsn  = false;
+        boolean hasWpa  = false;
+        boolean hasCcmp = false;
+        boolean hasTkip = false;
+        boolean hasWps  = false;
 
         int offset = 36;
         while (offset + 1 < raw.length) {
@@ -197,76 +233,68 @@ public class PassiveScanner implements AutoCloseable {
             if (offset + 2 + len > raw.length) break;
 
             switch (id) {
-                case 0 -> { // SSID
-                    // FIX 3: Validate SSID bytes before building a String
+                case 0 -> {
                     if (len == 0) {
                         ap.ssid = "<hidden>";
                     } else {
                         byte[] ssidBytes = Arrays.copyOfRange(raw, offset + 2, offset + 2 + len);
                         if (isPrintableUtf8(ssidBytes)) {
-                            String ssid = new String(ssidBytes, java.nio.charset.StandardCharsets.UTF_8).trim();
+                            String ssid = new String(ssidBytes,
+                                    java.nio.charset.StandardCharsets.UTF_8).trim();
                             ap.ssid = ssid.isEmpty() ? "<hidden>" : ssid;
                         } else {
-                            ap.ssid = "<hidden>"; // binary/garbled SSID — skip
+                            ap.ssid = "<hidden>";
                         }
                     }
                 }
-                case 3 -> { // DS Parameter Set (channel)
-                    if (len >= 1) ap.channel = raw[offset + 2] & 0xFF;
-                }
-                case 48 -> { // RSN (WPA2 / WPA3)
+                case 3 -> { if (len >= 1) ap.channel = raw[offset + 2] & 0xFF; }
+                case 48 -> {
                     hasRsn = true;
-                    // Parse RSN to detect CCMP vs TKIP cipher suites
                     if (len >= 8) {
                         int rsn = offset + 2;
-                        // Group cipher suite starts at rsn+2
-                        // Pairwise count at rsn+6 (2 bytes LE)
                         int pairwiseCount = (raw[rsn + 6] & 0xFF) | ((raw[rsn + 7] & 0xFF) << 8);
-                        int pairwiseOff = rsn + 8;
+                        int pairwiseOff   = rsn + 8;
                         for (int i = 0; i < pairwiseCount && pairwiseOff + 4 <= offset + 2 + len; i++) {
                             int cipherType = raw[pairwiseOff + 3] & 0xFF;
-                            if (cipherType == 4) hasCcmp = true;  // AES-CCMP
-                            if (cipherType == 2) hasTkip = true;   // TKIP
+                            if (cipherType == 4) hasCcmp = true;
+                            if (cipherType == 2) hasTkip = true;
                             pairwiseOff += 4;
                         }
                     }
                 }
-                case 221 -> { // Vendor-specific
+                case 221 -> {
                     if (len >= 4) {
-                        // Microsoft WPA OUI: 00-50-F2-01
                         if ((raw[offset+2]&0xFF)==0x00 && (raw[offset+3]&0xFF)==0x50
-                                && (raw[offset+4]&0xFF)==0xF2 && (raw[offset+5]&0xFF)==0x01) {
+                                && (raw[offset+4]&0xFF)==0xF2 && (raw[offset+5]&0xFF)==0x01)
                             hasWpa = true;
-                        }
-                        // WPS OUI: 00-50-F2-04
-                        if (len >= 4 && (raw[offset+2]&0xFF)==0x00 && (raw[offset+3]&0xFF)==0x50
-                                && (raw[offset+4]&0xFF)==0xF2 && (raw[offset+5]&0xFF)==0x04) {
+                        if ((raw[offset+2]&0xFF)==0x00 && (raw[offset+3]&0xFF)==0x50
+                                && (raw[offset+4]&0xFF)==0xF2 && (raw[offset+5]&0xFF)==0x04)
                             hasWps = true;
-                        }
                     }
                 }
             }
             offset += 2 + len;
         }
 
-        // FIX 2: Better security classification
         if (hasRsn) {
-            if (hasCcmp && !hasTkip) {
-                ap.security = hasWps ? "WPA2 (WPS!)" : "WPA2";
-            } else if (hasCcmp) {
-                ap.security = "WPA2/WPA3";
-            } else {
-                ap.security = "WPA2-TKIP"; // downgrade-vulnerable
-            }
+            if (hasCcmp && !hasTkip)  ap.security = hasWps ? "WPA2 (WPS!)" : "WPA2";
+            else if (hasCcmp)          ap.security = "WPA2/WPA3";
+            else                       ap.security = "WPA2-TKIP";
         } else if (hasWpa) {
             ap.security = hasTkip ? "WPA-TKIP" : "WPA";
         } else {
             ap.security = "OPEN";
         }
 
+        // ── CHANGE 3: mark channel active in hopper ──────────────────────────
+        if (hopper != null && ap.channel > 0) {
+            hopper.markChannelActive(ap.channel);
+        }
+
         rat.onAccessPointDiscovered(ap);
     }
 
+    // ── Probe Request parser ──────────────────────────────────────────────────
     private void parseProbeReq(byte[] raw) {
         String mac = formatMac(raw, 10);
         int offset = 24;
@@ -280,22 +308,16 @@ public class PassiveScanner implements AutoCloseable {
                 rat.onClientProbe(mac, ssid.isEmpty() ? "<any>" : ssid);
                 return;
             }
-            offset += 2 + Math.max(1, len); // guard against zero-len infinite loop
+            offset += 2 + Math.max(1, len);
         }
         rat.onClientProbe(mac, "<any>");
     }
 
-    // ── FIX 4: Correct addr mapping for deauth ───────────────────────────────
-    /**
-     * In a Deauthentication frame:
-     *   addr1 (bytes 4–9)  = destination / victim (who is being kicked)
-     *   addr2 (bytes 10–15)= source / attacker    (who sent the frame)
-     *   addr3 (bytes 16–21)= BSSID
-     */
+    // ── Deauth parser ─────────────────────────────────────────────────────────
     private void parseDeauth(byte[] raw) {
         if (raw.length < 22) return;
-        String dst = formatMac(raw, 4);  // victim
-        String src = formatMac(raw, 10); // attacker/sender
+        String dst = formatMac(raw, 4);
+        String src = formatMac(raw, 10);
         rat.onDeauthAttack(src, dst, 1);
     }
 
@@ -306,7 +328,6 @@ public class PassiveScanner implements AutoCloseable {
                 raw[offset+3], raw[offset+4], raw[offset+5]);
     }
 
-    /** Returns true if bytes represent valid UTF-8 with only printable chars. */
     private boolean isPrintableUtf8(byte[] bytes) {
         try {
             String s = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
@@ -316,8 +337,10 @@ public class PassiveScanner implements AutoCloseable {
         }
     }
 
+    // ── CHANGE 4: stop hopper in stop() ──────────────────────────────────────
     public void stop() {
         running = false;
+        if (hopper != null) hopper.stop();
         for (PcapHandle h : handles) {
             try { h.breakLoop(); } catch (Exception ignored) {}
             try { h.close();     } catch (Exception ignored) {}

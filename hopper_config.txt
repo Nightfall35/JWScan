@@ -1,0 +1,17 @@
+# BLACK ICE v2 — Channel Hopper Configuration
+ 
+# Milliseconds to dwell on each channel.
+# 150ms catches at least one beacon per AP (APs beacon every 100ms).
+dwell_ms=150
+ 
+# Include 5 GHz channels (1=yes, 0=no).
+band_5ghz=1
+ 
+# Include 6 GHz / Wi-Fi 6E channels (1=yes, 0=no).
+band_6ghz=0
+ 
+# Hopping strategy:
+#   SEQUENTIAL  — visit 1,2,3,...13,36,40,... in order
+#   INTERLEAVED — non-overlapping 2.4GHz first (1,6,11), then rest
+#   SMART       — weighted: more time on channels with known APs (recommended)
+strategy=SMART
