@@ -354,7 +354,7 @@ public class EnterpriseApiServer {
     }
 
     private void handleReport(HttpExchange ex) throws IOException {
-        if (!guard(ex, true)) return;
+        if (!guard(ex, false)) return;
 
         // Parse query string: ?site=Bank+HQ&title=Floor+3&operator=Ishmael
         String query = ex.getRequestURI().getQuery();
@@ -366,8 +366,12 @@ public class EnterpriseApiServer {
             PdfReportGenerator gen = new PdfReportGenerator(rat);
             byte[] pdf = gen.generate(site, title, operator);
 
-            String filename = "blackice_report_"
-                + java.time.LocalDate.now() + ".pdf";
+            String filename = "blackice_report_" + java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss")) + ".pdf";
+            java.nio.file.Path reportsDir = java.nio.file.Paths.get("reports");
+            java.nio.file.Files.createDirectories(reportsDir);
+            java.nio.file.Files.write(reportsDir.resolve(filename), pdf);
+            rat.println("[REPORT] Generated report saved to " + reportsDir.toAbsolutePath().resolve(filename));
+            
             ex.getResponseHeaders().set("Content-Type", "application/pdf");
             ex.getResponseHeaders().set("Content-Disposition",
                 "attachment; filename=\"" + filename + "\"");

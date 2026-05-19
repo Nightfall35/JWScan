@@ -96,8 +96,8 @@ public class PdfReportGenerator {
     private Font fBadge;
 
     private final Rat rat;
-    private final DateTimeFormatter dtfFull = DateTimeFormatter.ofPattern("dd MMMM yyyy, HH:mm");
-    private final DateTimeFormatter dtfDate = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+
+    private final DateTimeFormatter dtf= DateTimeFormatter.ofPattern("dd MMMM yyyy, HH:mm:ss" ).withZone(java.time.ZoneId.systemDefault());
 
     // ── Constructor ──────────────────────────────────────────────────────────
     public PdfReportGenerator(Rat rat) {
@@ -304,7 +304,7 @@ public class PdfReportGenerator {
 
         String[] labels = {"DATE", "OPERATOR", "GPS COORDS", "SURVEY READINGS"};
         String[] values = {
-            LocalDateTime.now().format(dtfFull),
+            dtf.format(java.time.Instant.now()),
             operator,
             String.format("%.6f, %.6f", stats.opLat, stats.opLon),
             String.valueOf(stats.surveyReadings)
@@ -325,7 +325,7 @@ public class PdfReportGenerator {
         cb.beginText();
         cb.setTextMatrix(MARGIN_L, 24);
         cb.showText("CONFIDENTIAL — FOR AUTHORIZED SECURITY PERSONNEL ONLY"
-                + " — Generated " + LocalDateTime.now().format(dtfFull)
+                + " — Generated " + dtf.format(java.time.Instant.now())
                 + " — NIGHTFALL35 / BLACK ICE v2");
         cb.endText();
     }
@@ -762,7 +762,7 @@ public class PdfReportGenerator {
             {"GPS survey readings",       String.valueOf(stats.surveyReadings)},
             {"Operator GPS position",     String.format("%.6f, %.6f", stats.opLat, stats.opLon)},
             {"GPS hardware lock",         stats.gpsActive ? "Yes" : "No (browser approximate)"},
-            {"Report generated",          LocalDateTime.now().format(dtfFull)},
+            {"Report generated",          dtf.format(java.time.Instant.now())},
             {"Platform",                  "BLACK ICE v2 — NIGHTFALL35"},
             {"Operator",                  operator},
         };
