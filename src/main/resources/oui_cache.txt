@@ -15904,26 +15904,20 @@ B43B52	Sagemcom Broadband SAS
 B43B52	Sagemcom Broadband SAS
 B0FC88	Sagemcom Broadband SAS
 B0FC88	Sagemcom Broadband SAS
-F832BA	VusionGroup
-F832BA	VusionGroup
-F8D811	Quectel Wireless Solutions Co.,Ltd.
-F8D811	Quectel Wireless Solutions Co.,Ltd.
-383904	ittim
-383904	ittim
 786BA5	Changchun Jetty Automotive Technology Co., LTD
 786BA5	Changchun Jetty Automotive Technology Co., LTD
 D013C1	Shenzhen Skyworth Digital  Technology  CO., Ltd
 D013C1	Shenzhen Skyworth Digital  Technology  CO., Ltd
-10B06E	Shenzhen Phaten Tech. LTD
-10B06E	Shenzhen Phaten Tech. LTD
 209395	nVent
 209395	nVent
-EC86C4	Mellanox Technologies, Inc.
-EC86C4	Mellanox Technologies, Inc.
-D05533	Palo Alto Networks
-D05533	Palo Alto Networks
-1CE587	Cisco Meraki
-1CE587	Cisco Meraki
+F832BA	VusionGroup
+F832BA	VusionGroup
+10B06E	Shenzhen Phaten Tech. LTD
+10B06E	Shenzhen Phaten Tech. LTD
+F8D811	Quectel Wireless Solutions Co.,Ltd.
+F8D811	Quectel Wireless Solutions Co.,Ltd.
+383904	ittim
+383904	ittim
 000130	Extreme Networks Headquarters
 000130	Extreme Networks Headquarters
 FC0A81	Extreme Networks Headquarters
@@ -31538,6 +31532,14 @@ EC50A6	Sagemcom Broadband SAS
 84679A	Arm Ltd
 38B4D3	BSH Hausgeräte GmbH
 38B4D3	BSH Hausgeräte GmbH
+000374	Schneider Electric
+000374	Schneider Electric
+0C5427	Dongguan Huayin Electronic Technology Co., Ltd.
+0C5427	Dongguan Huayin Electronic Technology Co., Ltd.
+989E85	Honor Device Co., Ltd.
+989E85	Honor Device Co., Ltd.
+000231	Ingersoll-Rand
+000231	Ingersoll-Rand
 BC4F2D	Apple, Inc.
 BC4F2D	Apple, Inc.
 8C8283	Apple, Inc.
@@ -31546,30 +31548,10 @@ BC4F2D	Apple, Inc.
 5CB8B7	Apple, Inc.
 109E6B	Apple, Inc.
 109E6B	Apple, Inc.
-989E85	Honor Device Co., Ltd.
-989E85	Honor Device Co., Ltd.
-0C5427	Dongguan Huayin Electronic Technology Co., Ltd.
-0C5427	Dongguan Huayin Electronic Technology Co., Ltd.
-14C7C4	Zyxel Communications Corporation
-14C7C4	Zyxel Communications Corporation
 EC2C0D	Apple, Inc.
 EC2C0D	Apple, Inc.
 D846CE	Apple, Inc.
 D846CE	Apple, Inc.
-000231	Ingersoll-Rand
-000231	Ingersoll-Rand
-000374	Schneider Electric
-000374	Schneider Electric
-44995B	GX India Pvt Ltd
-44995B	GX India Pvt Ltd
-780C26	Trafag AG
-780C26	Trafag AG
-7428AE	Mellanox Technologies, Inc.
-7428AE	Mellanox Technologies, Inc.
-2059D1	Mellanox Technologies, Inc.
-2059D1	Mellanox Technologies, Inc.
-649746	AzureWave Technology Inc.
-649746	AzureWave Technology Inc.
 6C8720	New H3C Technologies Co., Ltd
 6C8720	New H3C Technologies Co., Ltd
 0C8D7A	RADiflow
@@ -43224,6 +43206,8 @@ B4B5AF	Minsung Electronics
 0003A4	Imation Corp.
 0003AB	Bridge Information Systems
 0003AB	Bridge Information Systems
+0003CA	MTS Systems Corp.
+0003CA	MTS Systems Corp.
 0003CB	SystemGear Co., Ltd.
 0003CB	SystemGear Co., Ltd.
 00037C	Coax Media
@@ -47160,34 +47144,10 @@ C0A4CF	Nintendo Co.,Ltd
 087618	ViTrox Technologies Sdn. Bhd
 A05D0E	ALPSALPINE CO.,LTD.
 A05D0E	ALPSALPINE CO.,LTD.
-700B01	Sagemcom Broadband SAS
-700B01	Sagemcom Broadband SAS
-D8A756	Sagemcom Broadband SAS
-D8A756	Sagemcom Broadband SAS
-302478	Sagemcom Broadband SAS
-302478	Sagemcom Broadband SAS
 60F723	Beijing Xiaomi Mobile Software Co., Ltd
 60F723	Beijing Xiaomi Mobile Software Co., Ltd
-6CA613	AltoBeam Inc.
-6CA613	AltoBeam Inc.
-5818B4	Chengdu Quanjing Intelligent Technology Co.,Ltd
-5818B4	Chengdu Quanjing Intelligent Technology Co.,Ltd
-702393	Polytech A/S
-702393	Polytech A/S
-E4C0E2	Sagemcom Broadband SAS
-E4C0E2	Sagemcom Broadband SAS
-64FD96	Sagemcom Broadband SAS
-64FD96	Sagemcom Broadband SAS
-C4EB39	Sagemcom Broadband SAS
-C4EB39	Sagemcom Broadband SAS
-D4F829	Sagemcom Broadband SAS
-D4F829	Sagemcom Broadband SAS
-8CC5B4	Sagemcom Broadband SAS
-8CC5B4	Sagemcom Broadband SAS
-6CBAB8	Sagemcom Broadband SAS
-6CBAB8	Sagemcom Broadband SAS
-3C5836	Sagemcom Broadband SAS
-3C5836	Sagemcom Broadband SAS
+700B01	Sagemcom Broadband SAS
+700B01	Sagemcom Broadband SAS
 A03C20	Sagemcom Broadband SAS
 A03C20	Sagemcom Broadband SAS
 CCFAF1	Sagemcom Broadband SAS
@@ -47198,20 +47158,60 @@ FC6637	Sagemcom Broadband SAS
 FC6637	Sagemcom Broadband SAS
 647999	Sagemcom Broadband SAS
 647999	Sagemcom Broadband SAS
+64FD96	Sagemcom Broadband SAS
+64FD96	Sagemcom Broadband SAS
+C4EB39	Sagemcom Broadband SAS
+C4EB39	Sagemcom Broadband SAS
 943C96	Sagemcom Broadband SAS
 943C96	Sagemcom Broadband SAS
 C4EB41	Sagemcom Broadband SAS
 C4EB41	Sagemcom Broadband SAS
 C4EB43	Sagemcom Broadband SAS
 C4EB43	Sagemcom Broadband SAS
+D8A756	Sagemcom Broadband SAS
+D8A756	Sagemcom Broadband SAS
+302478	Sagemcom Broadband SAS
+302478	Sagemcom Broadband SAS
 B86685	Sagemcom Broadband SAS
 B86685	Sagemcom Broadband SAS
-7C90E9	GUANGDONG OPPO MOBILE TELECOMMUNICATIONS CORP.,LTD
-7C90E9	GUANGDONG OPPO MOBILE TELECOMMUNICATIONS CORP.,LTD
+D4F829	Sagemcom Broadband SAS
+D4F829	Sagemcom Broadband SAS
+8CC5B4	Sagemcom Broadband SAS
+8CC5B4	Sagemcom Broadband SAS
+6CBAB8	Sagemcom Broadband SAS
+6CBAB8	Sagemcom Broadband SAS
+E4C0E2	Sagemcom Broadband SAS
+E4C0E2	Sagemcom Broadband SAS
+3C5836	Sagemcom Broadband SAS
+3C5836	Sagemcom Broadband SAS
+702393	Polytech A/S
+702393	Polytech A/S
+6CA613	AltoBeam Inc.
+6CA613	AltoBeam Inc.
+5818B4	Chengdu Quanjing Intelligent Technology Co.,Ltd
+5818B4	Chengdu Quanjing Intelligent Technology Co.,Ltd
+D00C5E	Nanjing Qinheng Microelectronics Co., Ltd.
+D00C5E	Nanjing Qinheng Microelectronics Co., Ltd.
+90DA72	Espressif Inc.
+90DA72	Espressif Inc.
 3814A1	LG Innotek
 3814A1	LG Innotek
 3089EC	Nintendo Co.,Ltd
 3089EC	Nintendo Co.,Ltd
+7C90E9	GUANGDONG OPPO MOBILE TELECOMMUNICATIONS CORP.,LTD
+7C90E9	GUANGDONG OPPO MOBILE TELECOMMUNICATIONS CORP.,LTD
+B81F3F	Espressif Inc.
+B81F3F	Espressif Inc.
+000521	Schneider Electric
+000521	Schneider Electric
+C44268	CRESTRON ELECTRONICS, INC.
+C44268	CRESTRON ELECTRONICS, INC.
+A087BE	Apple, Inc.
+A087BE	Apple, Inc.
+34F8DD	Apple, Inc.
+34F8DD	Apple, Inc.
+7CD62C	Apple, Inc.
+7CD62C	Apple, Inc.
 300916	Apple, Inc.
 300916	Apple, Inc.
 602ED5	Apple, Inc.
@@ -47222,38 +47222,6 @@ F4A1A6	Apple, Inc.
 F4A1A6	Apple, Inc.
 14D537	All Inspire Health Inc.
 14D537	All Inspire Health Inc.
-B81F3F	Espressif Inc.
-B81F3F	Espressif Inc.
-90DA72	Espressif Inc.
-90DA72	Espressif Inc.
-D00C5E	Nanjing Qinheng Microelectronics Co., Ltd.
-D00C5E	Nanjing Qinheng Microelectronics Co., Ltd.
-A087BE	Apple, Inc.
-A087BE	Apple, Inc.
-34F8DD	Apple, Inc.
-34F8DD	Apple, Inc.
-7CD62C	Apple, Inc.
-7CD62C	Apple, Inc.
-6C688A	Amazon Technologies Inc.
-6C688A	Amazon Technologies Inc.
-000521	Schneider Electric
-000521	Schneider Electric
-C44268	CRESTRON ELECTRONICS, INC.
-C44268	CRESTRON ELECTRONICS, INC.
-FCB948	McScience Inc.
-FCB948	McScience Inc.
-441DE5	XCENA Inc.
-441DE5	XCENA Inc.
-58F658	Edifier International
-58F658	Edifier International
-E0D239	TECHNOLID, LLC
-E0D239	TECHNOLID, LLC
-AC236E	Apismoon Electric Pte. Ltd.
-AC236E	Apismoon Electric Pte. Ltd.
-FC1119	Silicon Laboratories
-FC1119	Silicon Laboratories
-0003CA	Temposonics, LLC
-0003CA	Temposonics, LLC
 B00C9D	Quectel Wireless Solutions Co.,Ltd.
 B00C9D	Quectel Wireless Solutions Co.,Ltd.
 F0AB1F	zte corporation
@@ -63106,56 +63074,50 @@ BCA6E7	Sichuan Odot Automation System Co., Ltd.
 289EFC	Sagemcom Broadband SAS
 A89A93	Sagemcom Broadband SAS
 A89A93	Sagemcom Broadband SAS
-981E19	Sagemcom Broadband SAS
-981E19	Sagemcom Broadband SAS
-48D24F	Sagemcom Broadband SAS
-48D24F	Sagemcom Broadband SAS
 DC330E	Qingdao Haier Technology Co.Ltd
 DC330E	Qingdao Haier Technology Co.Ltd
 44CC6E	Rockwell Automation
 44CC6E	Rockwell Automation
 6C55F6	eero inc.
 6C55F6	eero inc.
-A829DC	TP-Link Systems Inc.
-A829DC	TP-Link Systems Inc.
-289104	TP-Link Systems Inc.
-289104	TP-Link Systems Inc.
 2C0613	China Mobile Group Device Co.,Ltd.
 2C0613	China Mobile Group Device Co.,Ltd.
-B03FD3	Espressif Inc.
-B03FD3	Espressif Inc.
-C8D778	BSH Hausgeräte GmbH
-C8D778	BSH Hausgeräte GmbH
+D427FF	Sagemcom Broadband SAS
+D427FF	Sagemcom Broadband SAS
 B01FF4	Sagemcom Broadband SAS
 B01FF4	Sagemcom Broadband SAS
 6418DF	Sagemcom Broadband SAS
 6418DF	Sagemcom Broadband SAS
 D45039	Sagemcom Broadband SAS
 D45039	Sagemcom Broadband SAS
-647B1E	Sagemcom Broadband SAS
-647B1E	Sagemcom Broadband SAS
-441524	Sagemcom Broadband SAS
-441524	Sagemcom Broadband SAS
-D427FF	Sagemcom Broadband SAS
-D427FF	Sagemcom Broadband SAS
+48D24F	Sagemcom Broadband SAS
+48D24F	Sagemcom Broadband SAS
 44ADB1	Sagemcom Broadband SAS
 44ADB1	Sagemcom Broadband SAS
 D06EDE	Sagemcom Broadband SAS
 D06EDE	Sagemcom Broadband SAS
-6CFFCE	Sagemcom Broadband SAS
-6CFFCE	Sagemcom Broadband SAS
+647B1E	Sagemcom Broadband SAS
+647B1E	Sagemcom Broadband SAS
+441524	Sagemcom Broadband SAS
+441524	Sagemcom Broadband SAS
+A829DC	TP-Link Systems Inc.
+A829DC	TP-Link Systems Inc.
+289104	TP-Link Systems Inc.
+289104	TP-Link Systems Inc.
 F04DD4	Sagemcom Broadband SAS
 F04DD4	Sagemcom Broadband SAS
+6CFFCE	Sagemcom Broadband SAS
+6CFFCE	Sagemcom Broadband SAS
+981E19	Sagemcom Broadband SAS
+981E19	Sagemcom Broadband SAS
 843E03	Sagemcom Broadband SAS
 843E03	Sagemcom Broadband SAS
+C8D778	BSH Hausgeräte GmbH
+C8D778	BSH Hausgeräte GmbH
 547370	The LEGO Group
 547370	The LEGO Group
-580FA5	Apple, Inc.
-580FA5	Apple, Inc.
-40B570	Hangzhou Hikvision Digital Technology Co.,Ltd.
-40B570	Hangzhou Hikvision Digital Technology Co.,Ltd.
-B80E1D	PAX Computer Technology(Shenzhen) Ltd.
-B80E1D	PAX Computer Technology(Shenzhen) Ltd.
+B03FD3	Espressif Inc.
+B03FD3	Espressif Inc.
 F416E7	Skyverse Limited
 F416E7	Skyverse Limited
 B49A7D	GUANGDONG OPPO MOBILE TELECOMMUNICATIONS CORP.,LTD
@@ -63166,16 +63128,10 @@ BC89C1	Apple, Inc.
 BC89C1	Apple, Inc.
 7062CB	Apple, Inc.
 7062CB	Apple, Inc.
-087B0F	Amazon Technologies Inc.
-087B0F	Amazon Technologies Inc.
-44B4A0	Mellanox Technologies, Inc.
-44B4A0	Mellanox Technologies, Inc.
-647D4D	Arcadyan Corporation
-647D4D	Arcadyan Corporation
-54F283	Silicon Laboratories
-54F283	Silicon Laboratories
-A04E8D	Cisco Meraki
-A04E8D	Cisco Meraki
+580FA5	Apple, Inc.
+580FA5	Apple, Inc.
+40B570	Hangzhou Hikvision Digital Technology Co.,Ltd.
+40B570	Hangzhou Hikvision Digital Technology Co.,Ltd.
 C85CE2	IEEE Registration Authority
 C85CE2	IEEE Registration Authority
 DCEE14	ADT Technology
@@ -75856,6 +75812,8 @@ E80B13	Akib Systems Taiwan, INC
 00C0FA	CANARY COMMUNICATIONS, INC.
 00C01C	INTERLINK COMMUNICATIONS LTD.
 00C01C	INTERLINK COMMUNICATIONS LTD.
+00C096	TAMURA CORPORATION
+00C096	TAMURA CORPORATION
 00C04E	COMTROL CORPORATION
 00C04E	COMTROL CORPORATION
 00C044	EMCOM CORPORATION
@@ -78816,12 +78774,14 @@ A8DDEC	Hangzhou BroadLink Technology Co., Ltd
 6CDFD9	Concept2, Inc.
 38F406	Jinan USR IOT Technology Limited
 38F406	Jinan USR IOT Technology Limited
+E0A447	zte corporation
+E0A447	zte corporation
+80E8A4	zte corporation
+80E8A4	zte corporation
 20AEB6	Huawei Device Co., Ltd.
 20AEB6	Huawei Device Co., Ltd.
 7C162A	Huawei Device Co., Ltd.
 7C162A	Huawei Device Co., Ltd.
-E0A447	zte corporation
-E0A447	zte corporation
 B0DE31	Samsung Electronics Co.,Ltd
 B0DE31	Samsung Electronics Co.,Ltd
 346B46	Sagemcom Broadband SAS
@@ -78830,28 +78790,26 @@ D05794	Sagemcom Broadband SAS
 D05794	Sagemcom Broadband SAS
 5CB13E	Sagemcom Broadband SAS
 5CB13E	Sagemcom Broadband SAS
-F08175	Sagemcom Broadband SAS
-F08175	Sagemcom Broadband SAS
-A86ABB	Sagemcom Broadband SAS
-A86ABB	Sagemcom Broadband SAS
-7CE87F	Sagemcom Broadband SAS
-7CE87F	Sagemcom Broadband SAS
-3C585D	Sagemcom Broadband SAS
-3C585D	Sagemcom Broadband SAS
 B86AF1	Sagemcom Broadband SAS
 B86AF1	Sagemcom Broadband SAS
 CC5830	Sagemcom Broadband SAS
 CC5830	Sagemcom Broadband SAS
 D4B5CD	Sagemcom Broadband SAS
 D4B5CD	Sagemcom Broadband SAS
-30F600	Sagemcom Broadband SAS
-30F600	Sagemcom Broadband SAS
-80E8A4	zte corporation
-80E8A4	zte corporation
+F08175	Sagemcom Broadband SAS
+F08175	Sagemcom Broadband SAS
+A86ABB	Sagemcom Broadband SAS
+A86ABB	Sagemcom Broadband SAS
 209A7D	Sagemcom Broadband SAS
 209A7D	Sagemcom Broadband SAS
+7CE87F	Sagemcom Broadband SAS
+7CE87F	Sagemcom Broadband SAS
+3C585D	Sagemcom Broadband SAS
+3C585D	Sagemcom Broadband SAS
 506F0C	Sagemcom Broadband SAS
 506F0C	Sagemcom Broadband SAS
+30F600	Sagemcom Broadband SAS
+30F600	Sagemcom Broadband SAS
 DCCB35	EM Microelectronic
 DCCB35	EM Microelectronic
 5C5A35	eero inc.
@@ -78860,45 +78818,37 @@ DCCB35	EM Microelectronic
 00107F	CRESTRON ELECTRONICS, INC.
 948835	CRESTRON ELECTRONICS, INC.
 948835	CRESTRON ELECTRONICS, INC.
+A039F9	Sagemcom Broadband SAS
+A039F9	Sagemcom Broadband SAS
+54B27E	Sagemcom Broadband SAS
+54B27E	Sagemcom Broadband SAS
 107A2A	Microsoft Corporation
 107A2A	Microsoft Corporation
 74D809	Microsoft Corporation
 74D809	Microsoft Corporation
 E04F95	Sagemcom Broadband SAS
 E04F95	Sagemcom Broadband SAS
-A039F9	Sagemcom Broadband SAS
-A039F9	Sagemcom Broadband SAS
-54B27E	Sagemcom Broadband SAS
-54B27E	Sagemcom Broadband SAS
 5022C9	Bel Power Solutions, Inc.
 5022C9	Bel Power Solutions, Inc.
 745D43	BSH Hausgeräte GmbH
 745D43	BSH Hausgeräte GmbH
+B490E5	GD Midea Air-Conditioning Equipment Co.,Ltd.
+B490E5	GD Midea Air-Conditioning Equipment Co.,Ltd.
+B8DC7D	VusionGroup
+B8DC7D	VusionGroup
 F86347	Sichuan AI-Link Technology Co., Ltd.
 F86347	Sichuan AI-Link Technology Co., Ltd.
 246404	GSD VIET NAM TECHNOLOGY COMPANY LIMITED
 246404	GSD VIET NAM TECHNOLOGY COMPANY LIMITED
 84016E	Honor Device Co., Ltd.
 84016E	Honor Device Co., Ltd.
-B490E5	GD Midea Air-Conditioning Equipment Co.,Ltd.
-B490E5	GD Midea Air-Conditioning Equipment Co.,Ltd.
-B8DC7D	VusionGroup
-B8DC7D	VusionGroup
 201F55	DJI Osmo Technology Co., Ltd.
 201F55	DJI Osmo Technology Co., Ltd.
 904DE2	Apple, Inc.
 904DE2	Apple, Inc.
-ECDCAA	Apple, Inc.
-ECDCAA	Apple, Inc.
 08240B	Apple, Inc.
 08240B	Apple, Inc.
+ECDCAA	Apple, Inc.
+ECDCAA	Apple, Inc.
 0C0EC1	IEEE Registration Authority
 0C0EC1	IEEE Registration Authority
-8C65EC	TUBITAK MAM
-8C65EC	TUBITAK MAM
-101988	Mother Computer Inc.
-101988	Mother Computer Inc.
-F8B22C	Roku, Inc
-F8B22C	Roku, Inc
-00C096	Tamu Radiance Corporation
-00C096	Tamu Radiance Corporation
