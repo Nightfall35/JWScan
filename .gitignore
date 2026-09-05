@@ -1,23 +1,25 @@
-﻿git # ── Secrets (NEVER commit these) ──
+﻿
+# ── Secrets (NEVER commit these) ──
+api_token.txt
+api_audit.log
 Wigle_config.txt
 gps_port.txt
-
+ 
 # ── Cache files ──
 wigle_cache.dat
 oui_cache.dat
-
-# ── Java compiled output ──
+ 
+# ── Java build output ──
+target/
 *.class
-
+*.jar
+ 
 # ── IDE folders ──
 .idea/
 *.iml
 .vscode/
-
+ 
 # ── OS junk ──
 Thumbs.db
 .DS_Store
-
-target/
-*.jar
-*.class
+ 
