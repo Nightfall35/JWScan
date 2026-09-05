@@ -133,9 +133,25 @@ public class EnterpriseApiServer {
 
     // ── Auth check ───────────────────────────────────────────────────────────
     private boolean isAuthorized(HttpExchange ex) {
+        String token = null;
         String authHeader = ex.getRequestHeaders().getFirst("Authorization");
-        if (authHeader == null || !authHeader.startsWith("Bearer ")) return false;
-        String token = authHeader.substring(7).trim();
+        if (authHeader != null && authHeader.startsWith("Bearer ")) {
+            token = authHeader.substring(7).trim();
+        } else {
+            // Fallback: ?token=... query param, for window.open()/EventSource
+            // callers that can't attach custom headers.
+            String query = ex.getRequestURI().getQuery();
+            if (query != null) {
+                for (String pair : query.split("&")) {
+                    int eq = pair.indexOf('=');
+                    if (eq > 0 && pair.substring(0, eq).equals("token")) {
+                        token = URLDecoder.decode(pair.substring(eq + 1), StandardCharsets.UTF_8);
+                        break;
+                    }
+                }
+            }
+        }
+        if (token == null) return false;
         // Constant-time comparison
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-256");
@@ -236,8 +252,10 @@ public class EnterpriseApiServer {
             sendError(ex, 404, "Not found");
             return;
         }
-        // Delegate to Rat's embedded dashboard
-        byte[] html = rat.getDashboardHtml().getBytes(StandardCharsets.UTF_8);
+        // Delegate to Rat's embedded dashboard, injecting the API token so
+        // client-side JS can attach it to authenticated requests.
+        String htmlStr = rat.getDashboardHtml().replace("__API_TOKEN__", apiToken);
+        byte[] html = htmlStr.getBytes(StandardCharsets.UTF_8);
         ex.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
         ex.sendResponseHeaders(200, html.length);
         ex.getResponseBody().write(html);
