@@ -180,12 +180,14 @@ public class ChannelHopper {
             int ch = seq[idx];
             currentCh.set(ch);
 
+            int dwell = computeDwell(ch);
             boolean ok = setChannel(ch);
-            if (!ok) {
-                rat.printlnDebug("[HOPPER] Failed to set channel " + ch);
+            if (ok) {
+                rat.println("[HOPPER] Channel → " + ch + " (dwell " + dwell + "ms)");
+            } else {
+                rat.println("[HOPPER] Failed to set channel " + ch);
             }
 
-            int dwell = computeDwell(ch);
             try {
                 Thread.sleep(dwell);
             } catch (InterruptedException e) {

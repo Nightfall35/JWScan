@@ -1,0 +1,4 @@
+# Copy this file to api_token.txt, or let the app generate one on first run.
+# This is the local Enterprise API bearer token (not a Wigle credential).
+# Do not commit api_token.txt — it is gitignored.
+YOUR_API_BEARER_TOKEN

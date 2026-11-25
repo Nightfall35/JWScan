@@ -62,7 +62,25 @@ public class Rat {
     private PassiveScanner passiveScanner;
     private HttpServer     httpServer;
     private Deauther       deauther    = null;
+    private boolean        pcapExportCli = false;
+    private boolean        channelHopCli = false;
+    private boolean        exportCsvCli  = false;
+    private boolean        exportJsonCli = false;
+    private boolean        exportCsvEnabled  = false;
+    private boolean        exportJsonEnabled = false;
+    private String         exportDir = "exports";
+    private int            exportIntervalSec = 0;
+    private final Object   apExportLock = new Object();
 
+    // ── Historical session recording (opt-in, off by default) ────────────────
+    private boolean        sessionLogCli = false;
+    private boolean        sessionLogEnabled = false;
+    private String         sessionDir = "sessions";
+    private int            sessionIntervalSec = 5;
+    private Path           sessionFile = null;
+    private PrintWriter    sessionWriter = null;
+    private final Object   sessionLock = new Object();
+    private int            sessionSnapshots = 0;
 
     private final CopyOnWriteArrayList<HttpExchange> sseClients = new CopyOnWriteArrayList<>();
 
@@ -124,21 +142,16 @@ public class Rat {
         background.submit(this::downloadAndCacheIeeeOui);
         ai = new SwarmAi(this);
 
-        String gpsPortToTry = "COM3";
-        try {
-            java.nio.file.Path gpsConf = java.nio.file.Paths.get("gps_port.txt");
-            if (java.nio.file.Files.exists(gpsConf)) {
-                String line = java.nio.file.Files.readAllLines(gpsConf).stream()
-                    .filter(l -> !l.trim().isEmpty() && !l.startsWith("#"))
-                    .findFirst().orElse("COM3").trim();
-                gpsPortToTry = line;
+        String gpsPortToTry = resolveGpsPort();
+        if (gpsPortToTry == null) {
+            println("[GPS] No serial GPS found (checked gps_port.txt, /dev/ttyUSB0, /dev/ttyACM0, /dev/serial0, /dev/ttyAMA0). Dashboard will fall back to browser geolocation.");
+        } else {
+            try {
+                gpsReader = new GPSReader(gpsPortToTry);
+                println("[GPS] Reader started on " + gpsPortToTry + " (hasFix=false until NMEA lock)");
+            } catch (Exception e) {
+                println("[GPS] Could not start GPS reader on " + gpsPortToTry + ": " + e.getMessage());
             }
-        } catch (Exception ignored) {}
-        try {
-            gpsReader = new GPSReader(gpsPortToTry);
-            println("[GPS] Reader started on " + gpsPortToTry + " (hasFix=false until NMEA lock)");
-        } catch (Exception e) {
-            println("[GPS] Could not start GPS reader on " + gpsPortToTry + ": " + e.getMessage());
         }
 
         onDeauthAttack = (src, dst, count) -> {
@@ -159,6 +172,9 @@ public class Rat {
         println("==================================================");
         println("[API] Own MAC detected as: " + myMac);
 
+        loadApExportSettings();
+        loadSessionLogSettings();
+
         new EnterpriseApiServer(this, httpPort).start();
 
         background.submit(() -> {
@@ -169,7 +185,7 @@ public class Rat {
             } catch (Exception e) {
                 printlnStrongAlert("SCANNER FAILED TO START: " + e.getMessage());
                 printlnStrongAlert("CAUSE: " + (e.getCause() != null ? e.getCause().getMessage() : "unknown"));
-                printlnStrongAlert("CHECK: 1) Npcap installed  2) Running as Admin  3) Monitor-mode adapter present");
+                printlnStrongAlert(captureSetupHint());
                 printlnStrongAlert("SCANNER OFFLINE — dashboard still running at http://localhost:" + httpPort);
                 passiveScanner = null;
             }
@@ -180,9 +196,20 @@ public class Rat {
 
         scheduler.scheduleAtFixedRate(this::broadcastFullUpdate, 1, 1, TimeUnit.SECONDS);
         scheduler.scheduleAtFixedRate(this::evictStaleAps, 5, 5, TimeUnit.MINUTES);
+        if ((exportCsvEnabled || exportJsonEnabled) && exportIntervalSec > 0) {
+            scheduler.scheduleAtFixedRate(this::flushApExport,
+                    exportIntervalSec, exportIntervalSec, TimeUnit.SECONDS);
+        }
+        if (sessionLogEnabled) {
+            openSessionLog();
+            if (sessionWriter != null) {
+                scheduler.scheduleAtFixedRate(this::flushSessionSnapshot,
+                        sessionIntervalSec, sessionIntervalSec, TimeUnit.SECONDS);
+            }
+        }
         Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown));
 
-        println("DASHBOARD → http://localhost:" + httpPort);
+        printDashboardUrls();
         println("==================================================");
     }
 
@@ -386,10 +413,13 @@ public class Rat {
         long total = seenById.values().stream().filter(a -> now - a.lastSeen <= 3_000_000).count();
         long open  = seenById.values().stream().filter(a -> now - a.lastSeen <= 3_000_000 && isOpen(a)).count();
         long evil  = evilTwinBssids.size();
+        long hs    = seenById.values().stream().filter(a -> now - a.lastSeen <= 3_000_000)
+                .mapToLong(a -> a.handshakeCount).sum();
         String level = open == 0 ? "NOMINAL" : open < 3 ? "ELEVATED" : "CRITICAL";
         return "{\"total\":" + total
             + ",\"open\":" + open
             + ",\"evilTwins\":" + evil
+            + ",\"handshakes\":" + hs
             + ",\"deauthSources\":" + attackSrcMacs.size()
             + ",\"threatLevel\":\"" + level + "\""
             + ",\"gpsActive\":" + gpsActive
@@ -500,44 +530,38 @@ public class Rat {
         }
     }
 
-    // ── Helper: serialize a single AP to JSON ────────────────────────────────────
-   private String apToJson(AP ap) {
-    // Detect locally administered (randomised) MAC addresses.
-    // When bit 1 of the first octet is set, the MAC was randomly generated
-    // by the OS — no IEEE OUI exists for it, so vendor lookup is meaningless.
-    String vendor;
-    try {
-        String clean = ap.bssid.replace(":", "").replace("-","");
-        if(clean.length() >= 2) {
-            int firstByte = Integer.parseInt(clean.substring(0,2),16);
-            if(( firstByte & 0x02) != 0) {
-                vendor = "Randomised Mac";
-
-            }else {
-                vendor = ouiDatabase.lookup(ap.bssid);
-                if(vendor == null) vendor = "unknown";
-
+    // ── Helper: vendor lookup (randomised MACs have no IEEE OUI) ─────────────────
+    private String resolveVendor(AP ap) {
+        try {
+            String clean = ap.bssid == null ? "" : ap.bssid.replace(":", "").replace("-", "");
+            if (clean.length() >= 2) {
+                int firstByte = Integer.parseInt(clean.substring(0, 2), 16);
+                if ((firstByte & 0x02) != 0) return "Randomised Mac";
+                String vendor = ouiDatabase.lookup(ap.bssid);
+                return vendor != null ? vendor : "unknown";
             }
-        }else {
-            vendor = "unknown";
-
-        }
-    } catch (Exception e) {
-        vendor = "unknown";
+        } catch (Exception ignored) {}
+        return "unknown";
     }
 
-    return "{\"ssid\":\""     + jsonEscape(ap.ssid)     + "\","
-         + "\"bssid\":\""    + jsonEscape(ap.bssid)    + "\","
-         + "\"security\":\"" + jsonEscape(ap.security) + "\","
-         + "\"signal\":"     + ap.signal                + ","
-         + "\"channel\":"    + ap.channel               + ","
-         + "\"vendor\":\""   + jsonEscape(vendor)       + "\","
-         + "\"lat\":"        + ap.lat                   + ","
-         + "\"lon\":"        + ap.lon                   + ","
-         + "\"source\":\""   + jsonEscape(ap.source)    + "\","
-         + "\"lastSeen\":"   + ap.lastSeen
-         + "}";
-}
+    // ── Helper: serialize a single AP to JSON ────────────────────────────────────
+    private String apToJson(AP ap) {
+        String vendor = resolveVendor(ap);
+        return "{\"ssid\":\""     + jsonEscape(ap.ssid)     + "\","
+             + "\"bssid\":\""    + jsonEscape(ap.bssid)    + "\","
+             + "\"security\":\"" + jsonEscape(ap.security) + "\","
+             + "\"signal\":"     + ap.signal                + ","
+             + "\"channel\":"    + ap.channel               + ","
+             + "\"vendor\":\""   + jsonEscape(vendor)       + "\","
+             + "\"lat\":"        + ap.lat                   + ","
+             + "\"lon\":"        + ap.lon                   + ","
+             + "\"source\":\""   + jsonEscape(ap.source)    + "\","
+             + "\"firstSeen\":"  + ap.firstSeen             + ","
+             + "\"lastSeen\":"   + ap.lastSeen              + ","
+             + "\"handshakeSeen\":"  + ap.handshakeSeen     + ","
+             + "\"handshakeCount\":" + ap.handshakeCount
+             + "}";
+    }
 
     // ── AP event handlers ───────────────────────────────────────────────────────
     public void onAccessPointDiscovered(AP ap) {
@@ -552,6 +576,7 @@ public class Rat {
         ap.lastSeen       = System.currentTimeMillis();
 
         if (existing == null) {
+            ap.firstSeen = ap.lastSeen;
             seenById.put(id, ap);
             printlnAlert("NEW AP → " + summarize(ap));
             printlnDebug("Total APs in memory: " + seenById.size());
@@ -579,6 +604,34 @@ public class Rat {
         printlnStrongAlert("DEAUTH ATTACK → " + src + " → " + dst);
         soundBell();
         if (onDeauthAttack != null) onDeauthAttack.accept(src, dst, count);
+    }
+
+    /**
+     * Called when a complete 4-way WPA/WPA2 EAPOL handshake (messages 1–4)
+     * has been observed between an AP and a client. Detection only — no
+     * key material is passed or stored.
+     */
+    public void onHandshakeComplete(String bssid, String sta) {
+        if (bssid == null || bssid.isEmpty()) return;
+        String id = bssid;
+        AP ap = seenById.get(id);
+        if (ap == null) {
+            ap = new AP();
+            ap.bssid = bssid;
+            String known = knownSsids.get(bssid);
+            if (known != null && !known.isEmpty()) ap.ssid = known;
+            ap.security = "WPA2";
+            ap.firstSeen = System.currentTimeMillis();
+            ap.lastSeen  = ap.firstSeen;
+            AP raced = seenById.putIfAbsent(id, ap);
+            if (raced != null) ap = raced;
+        }
+        ap.handshakeCount = ap.handshakeCount + 1;
+        ap.handshakeSeen  = true;
+        ap.lastSeen       = System.currentTimeMillis();
+        String ssid = (ap.ssid == null || ap.ssid.isEmpty()) ? "<hidden>" : ap.ssid;
+        printlnAlert("HANDSHAKE COMPLETE → \"" + ssid + "\" " + bssid
+                + " ↔ " + sta + " (count " + ap.handshakeCount + ")");
     }
 
     @FunctionalInterface
@@ -687,6 +740,11 @@ public class Rat {
         println("\nShutting down BLACK ICE...");
         if (passiveScanner != null) passiveScanner.stop();
         stopSurvey();
+        if (exportCsvEnabled || exportJsonEnabled) {
+            try { dumpDiscoveredAps(exportCsvEnabled, exportJsonEnabled); }
+            catch (Exception e) { println("[EXPORT] Shutdown dump failed: " + e.getMessage()); }
+        }
+        closeSessionLog();
         localGeo.shutdown();
         scheduler.shutdownNow();
         background.shutdownNow();
@@ -875,6 +933,436 @@ public class Rat {
     public void soundBell()                  { System.out.print("\007"); System.out.flush(); }
 
 
+    // ── Discovered-AP CSV/JSON export ───────────────────────────────────────────
+    private void loadApExportSettings() {
+        exportCsvEnabled    = exportCsvCli  || readExportConfigInt("csv",  0) == 1;
+        exportJsonEnabled   = exportJsonCli || readExportConfigInt("json", 0) == 1;
+        exportDir           = readExportConfigStr("dir", "exports");
+        exportIntervalSec   = readExportConfigInt("interval_sec", 0);
+        if (exportIntervalSec < 0) exportIntervalSec = 0;
+        if (exportCsvEnabled || exportJsonEnabled) {
+            println("[EXPORT] AP snapshot export enabled → csv=" + exportCsvEnabled
+                    + " json=" + exportJsonEnabled + " dir=" + exportDir
+                    + (exportIntervalSec > 0
+                        ? " interval=" + exportIntervalSec + "s"
+                        : " (on shutdown)"));
+        }
+    }
+
+    private int readExportConfigInt(String key, int defaultValue) {
+        String raw = readExportConfigRaw(key);
+        if (raw == null) return defaultValue;
+        try { return Integer.parseInt(raw); } catch (NumberFormatException e) { return defaultValue; }
+    }
+
+    private String readExportConfigStr(String key, String defaultValue) {
+        String raw = readExportConfigRaw(key);
+        return raw != null ? raw : defaultValue;
+    }
+
+    private String readExportConfigRaw(String key) {
+        try {
+            Path f = Paths.get("export_config.txt");
+            if (!Files.exists(f)) return null;
+            for (String line : Files.readAllLines(f)) {
+                line = line.trim();
+                if (line.startsWith("#") || line.isEmpty()) continue;
+                String[] parts = line.split("=", 2);
+                if (parts.length == 2 && parts[0].trim().equals(key)) {
+                    return parts[1].trim();
+                }
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private void flushApExport() {
+        try {
+            dumpDiscoveredAps(exportCsvEnabled, exportJsonEnabled);
+        } catch (Exception e) {
+            println("[EXPORT] Periodic dump failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Writes a timestamped snapshot of the in-memory AP list to exports/.
+     * Called on shutdown (if enabled), on a periodic timer (if interval_sec > 0),
+     * and by GET /api/v1/export/aps.csv|aps.json (always available).
+     */
+    public ApExportResult dumpDiscoveredAps(boolean writeCsv, boolean writeJson) throws IOException {
+        synchronized (apExportLock) {
+            if (!writeCsv && !writeJson) {
+                return new ApExportResult(null, null, new byte[0], new byte[0], 0);
+            }
+            Files.createDirectories(Paths.get(exportDir));
+            String ts = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
+            Path csvPath  = writeCsv  ? Paths.get(exportDir, "blackice_" + ts + ".csv")  : null;
+            Path jsonPath = writeJson ? Paths.get(exportDir, "blackice_" + ts + ".json") : null;
+
+            List<AP> aps = new ArrayList<>(seenById.values());
+            aps.sort(Comparator.comparing((AP a) -> a.bssid == null ? "" : a.bssid));
+
+            byte[] csvBytes  = writeCsv  ? buildApExportCsv(aps).getBytes(StandardCharsets.UTF_8)  : new byte[0];
+            byte[] jsonBytes = writeJson ? buildApExportJson(aps).getBytes(StandardCharsets.UTF_8) : new byte[0];
+
+            if (csvPath != null) {
+                Files.write(csvPath, csvBytes);
+                println("[EXPORT] Wrote " + aps.size() + " APs → " + csvPath.toAbsolutePath());
+            }
+            if (jsonPath != null) {
+                Files.write(jsonPath, jsonBytes);
+                println("[EXPORT] Wrote " + aps.size() + " APs → " + jsonPath.toAbsolutePath());
+            }
+            return new ApExportResult(csvPath, jsonPath, csvBytes, jsonBytes, aps.size());
+        }
+    }
+
+    private String buildApExportCsv(List<AP> aps) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("ssid,bssid,channel,signal,security,vendor,lat,lon,first_seen,last_seen,handshake_seen,handshake_count\n");
+        for (AP ap : aps) {
+            sb.append(csvEscape(ap.ssid)).append(',')
+              .append(csvEscape(ap.bssid)).append(',')
+              .append(ap.channel).append(',')
+              .append(ap.signal).append(',')
+              .append(csvEscape(ap.security)).append(',')
+              .append(csvEscape(resolveVendor(ap))).append(',');
+            if (ap.isPositionResolved()) {
+                sb.append(String.format(Locale.US, "%.8f,%.8f", ap.lat, ap.lon));
+            } else {
+                sb.append(',');
+            }
+            sb.append(',')
+              .append(csvEscape(formatEpoch(ap.firstSeen))).append(',')
+              .append(csvEscape(formatEpoch(ap.lastSeen))).append(',')
+              .append(ap.handshakeSeen ? "1" : "0").append(',')
+              .append(ap.handshakeCount)
+              .append('\n');
+        }
+        return sb.toString();
+    }
+
+    private String buildApExportJson(List<AP> aps) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"exportedAt\":\"").append(jsonEscape(LocalDateTime.now().format(dtf)))
+          .append("\",\"count\":").append(aps.size())
+          .append(",\"aps\":[");
+        boolean first = true;
+        for (AP ap : aps) {
+            if (!first) sb.append(',');
+            first = false;
+            sb.append("{\"ssid\":\"").append(jsonEscape(ap.ssid)).append("\",")
+              .append("\"bssid\":\"").append(jsonEscape(ap.bssid)).append("\",")
+              .append("\"channel\":").append(ap.channel).append(',')
+              .append("\"signal\":").append(ap.signal).append(',')
+              .append("\"security\":\"").append(jsonEscape(ap.security)).append("\",")
+              .append("\"vendor\":\"").append(jsonEscape(resolveVendor(ap))).append("\",");
+            if (ap.isPositionResolved()) {
+                sb.append("\"lat\":").append(ap.lat).append(",\"lon\":").append(ap.lon).append(',');
+            } else {
+                sb.append("\"lat\":null,\"lon\":null,");
+            }
+            sb.append("\"firstSeen\":").append(ap.firstSeen).append(',')
+              .append("\"lastSeen\":").append(ap.lastSeen).append(',')
+              .append("\"firstSeenText\":\"").append(jsonEscape(formatEpoch(ap.firstSeen))).append("\",")
+              .append("\"lastSeenText\":\"").append(jsonEscape(formatEpoch(ap.lastSeen))).append("\",")
+              .append("\"handshakeSeen\":").append(ap.handshakeSeen).append(',')
+              .append("\"handshakeCount\":").append(ap.handshakeCount).append('}');
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+
+    private String formatEpoch(long epochMs) {
+        return LocalDateTime.ofInstant(java.time.Instant.ofEpochMilli(epochMs), ZoneId.systemDefault()).format(dtf);
+    }
+
+    // ── Historical session recording / replay API ──────────────────────────────
+    private void loadSessionLogSettings() {
+        sessionLogEnabled  = sessionLogCli || readSessionConfigInt("enabled", 0) == 1;
+        sessionDir         = readSessionConfigStr("dir", "sessions");
+        sessionIntervalSec = readSessionConfigInt("interval_sec", 5);
+        if (sessionIntervalSec < 1) sessionIntervalSec = 5;
+        if (sessionLogEnabled) {
+            println("[SESSION] Snapshot recording enabled → dir=" + sessionDir
+                    + " interval=" + sessionIntervalSec + "s");
+        }
+    }
+
+    private int readSessionConfigInt(String key, int defaultValue) {
+        String raw = readSessionConfigRaw(key);
+        if (raw == null) return defaultValue;
+        try { return Integer.parseInt(raw); } catch (NumberFormatException e) { return defaultValue; }
+    }
+
+    private String readSessionConfigStr(String key, String defaultValue) {
+        String raw = readSessionConfigRaw(key);
+        return raw != null ? raw : defaultValue;
+    }
+
+    private String readSessionConfigRaw(String key) {
+        try {
+            Path f = Paths.get("session_config.txt");
+            if (!Files.exists(f)) return null;
+            for (String line : Files.readAllLines(f)) {
+                line = line.trim();
+                if (line.startsWith("#") || line.isEmpty()) continue;
+                String[] parts = line.split("=", 2);
+                if (parts.length == 2 && parts[0].trim().equals(key)) {
+                    return parts[1].trim();
+                }
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private void openSessionLog() {
+        synchronized (sessionLock) {
+            if (sessionWriter != null) return;
+            try {
+                Files.createDirectories(Paths.get(sessionDir));
+                String ts = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
+                sessionFile = Paths.get(sessionDir, "session_" + ts + ".jsonl");
+                sessionWriter = new PrintWriter(Files.newBufferedWriter(sessionFile,
+                        StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND));
+                sessionSnapshots = 0;
+                println("[SESSION] Recording snapshots every " + sessionIntervalSec
+                        + "s → " + sessionFile.toAbsolutePath());
+            } catch (Exception e) {
+                sessionWriter = null;
+                sessionFile = null;
+                sessionLogEnabled = false;
+                println("[SESSION] Failed to open session log: " + e.getMessage());
+            }
+        }
+    }
+
+    private void flushSessionSnapshot() {
+        try {
+            writeSessionSnapshot();
+        } catch (Exception e) {
+            println("[SESSION] Snapshot write failed: " + e.getMessage());
+        }
+    }
+
+    private void writeSessionSnapshot() {
+        synchronized (sessionLock) {
+            if (sessionWriter == null) return;
+            sessionWriter.println(buildSessionSnapshotJson());
+            sessionWriter.flush();
+            sessionSnapshots++;
+        }
+    }
+
+    private String buildSessionSnapshotJson() {
+        long now = System.currentTimeMillis();
+        StringBuilder sb = new StringBuilder(512);
+        sb.append("{\"t\":").append(now)
+          .append(",\"operator\":{\"lat\":").append(operatorLat)
+          .append(",\"lon\":").append(operatorLon)
+          .append(",\"gps\":").append(gpsActive)
+          .append("},\"aps\":{");
+        boolean first = true;
+        int count = 0;
+        for (Map.Entry<String, AP> e : seenById.entrySet()) {
+            AP ap = e.getValue();
+            if (now - ap.lastSeen > 3_000_000) continue;
+            if (!first) sb.append(',');
+            first = false;
+            sb.append("\"").append(jsonEscape(e.getKey())).append("\":")
+              .append(sessionApToJson(ap));
+            count++;
+        }
+        sb.append("},\"count\":").append(count).append('}');
+        return sb.toString();
+    }
+
+    private String sessionApToJson(AP ap) {
+        String vendor = resolveVendor(ap);
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"ssid\":\"").append(jsonEscape(ap.ssid)).append("\",")
+          .append("\"bssid\":\"").append(jsonEscape(ap.bssid)).append("\",")
+          .append("\"security\":\"").append(jsonEscape(ap.security)).append("\",")
+          .append("\"signal\":").append(ap.signal).append(',')
+          .append("\"channel\":").append(ap.channel).append(',')
+          .append("\"vendor\":\"").append(jsonEscape(vendor)).append("\",");
+        if (ap.isPositionResolved()) {
+            sb.append("\"lat\":").append(ap.lat).append(",\"lon\":").append(ap.lon);
+        } else {
+            sb.append("\"lat\":null,\"lon\":null");
+        }
+        sb.append(",\"source\":\"").append(jsonEscape(ap.source)).append("\",")
+          .append("\"firstSeen\":").append(ap.firstSeen).append(',')
+          .append("\"lastSeen\":").append(ap.lastSeen).append('}');
+        return sb.toString();
+    }
+
+    private void closeSessionLog() {
+        synchronized (sessionLock) {
+            if (sessionWriter == null) return;
+            try { writeSessionSnapshot(); } catch (Exception ignored) {}
+            try { sessionWriter.flush(); sessionWriter.close(); } catch (Exception ignored) {}
+            String name = sessionFile != null ? sessionFile.getFileName().toString() : "session";
+            println("[SESSION] Closed " + name + " — " + sessionSnapshots + " snapshots");
+            sessionWriter = null;
+        }
+    }
+
+    /**
+     * Lists saved (and in-progress) session logs as a JSON object.
+     * EnterpriseApiServer serves this on GET /api/v1/sessions.
+     */
+    public String listSessionsJson() {
+        flushActiveSessionWriter();
+        Path dir = Paths.get(sessionDir);
+        String activeName = null;
+        synchronized (sessionLock) {
+            if (sessionFile != null) activeName = sessionFile.getFileName().toString();
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"recording\":").append(sessionWriter != null)
+          .append(",\"dir\":\"").append(jsonEscape(sessionDir)).append("\"")
+          .append(",\"intervalSec\":").append(sessionIntervalSec)
+          .append(",\"activeFile\":")
+          .append(activeName == null ? "null" : "\"" + jsonEscape(activeName) + "\"")
+          .append(",\"activeSnapshots\":").append(sessionSnapshots)
+          .append(",\"sessions\":[");
+        boolean first = true;
+        if (Files.isDirectory(dir)) {
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir, "session_*.jsonl")) {
+                List<Path> files = new ArrayList<>();
+                for (Path p : stream) files.add(p);
+                files.sort(Comparator.comparing((Path p) -> p.getFileName().toString()).reversed());
+                for (Path p : files) {
+                    SessionMeta meta = scanSessionFile(p);
+                    if (!first) sb.append(',');
+                    first = false;
+                    sb.append("{\"id\":\"").append(jsonEscape(p.getFileName().toString())).append("\",")
+                      .append("\"startedAt\":").append(meta.startedAt).append(',')
+                      .append("\"endedAt\":").append(meta.endedAt).append(',')
+                      .append("\"snapshots\":").append(meta.snapshots).append(',')
+                      .append("\"aps\":").append(meta.aps).append(',')
+                      .append("\"bytes\":").append(meta.bytes)
+                      .append('}');
+                }
+            } catch (Exception e) {
+                println("[SESSION] Failed to list sessions: " + e.getMessage());
+            }
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+
+    /**
+     * Returns one session as {"id":"...","snapshots":[...]}, or null if not found.
+     * EnterpriseApiServer serves this on GET /api/v1/sessions/{id}.
+     */
+    public String getSessionJson(String id) {
+        Path p = resolveSessionFile(id);
+        if (p == null) return null;
+        flushActiveSessionWriter();
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"id\":\"").append(jsonEscape(p.getFileName().toString())).append("\",\"snapshots\":[");
+        boolean first = true;
+        try (BufferedReader br = Files.newBufferedReader(p, StandardCharsets.UTF_8)) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty() || line.charAt(0) != '{') continue;
+                if (!first) sb.append(',');
+                first = false;
+                sb.append(line);
+            }
+        } catch (Exception e) {
+            println("[SESSION] Failed to read " + p.getFileName() + ": " + e.getMessage());
+            return null;
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+
+    private void flushActiveSessionWriter() {
+        synchronized (sessionLock) {
+            if (sessionWriter != null) sessionWriter.flush();
+        }
+    }
+
+    private Path resolveSessionFile(String id) {
+        if (id == null) return null;
+        String name = Paths.get(id).getFileName().toString();
+        if (!name.matches("session_[A-Za-z0-9._-]+\\.jsonl")) return null;
+        try {
+            Path dir = Paths.get(sessionDir).toAbsolutePath().normalize();
+            Path p = dir.resolve(name).normalize();
+            if (!p.startsWith(dir)) return null;
+            return Files.isRegularFile(p) ? p : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static final class SessionMeta {
+        long startedAt;
+        long endedAt;
+        int snapshots;
+        int aps;
+        long bytes;
+    }
+
+    private SessionMeta scanSessionFile(Path p) {
+        SessionMeta m = new SessionMeta();
+        try {
+            m.bytes = Files.size(p);
+            Set<String> bssids = new HashSet<>();
+            try (BufferedReader br = Files.newBufferedReader(p, StandardCharsets.UTF_8)) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    line = line.trim();
+                    if (line.isEmpty() || line.charAt(0) != '{') continue;
+                    m.snapshots++;
+                    long t = extractJsonLong(line, "t");
+                    if (t > 0) {
+                        if (m.startedAt == 0) m.startedAt = t;
+                        m.endedAt = t;
+                    }
+                    extractJsonBssids(line, bssids);
+                }
+            }
+            m.aps = bssids.size();
+        } catch (Exception ignored) {}
+        return m;
+    }
+
+    private static long extractJsonLong(String json, String key) {
+        String needle = "\"" + key + "\":";
+        int i = json.indexOf(needle);
+        if (i < 0) return 0;
+        i += needle.length();
+        int j = i;
+        while (j < json.length()) {
+            char c = json.charAt(j);
+            if (c == '-' || (c >= '0' && c <= '9')) { j++; continue; }
+            break;
+        }
+        if (j == i) return 0;
+        try { return Long.parseLong(json.substring(i, j)); } catch (NumberFormatException e) { return 0; }
+    }
+
+    private static void extractJsonBssids(String json, Set<String> out) {
+        String needle = "\"bssid\":\"";
+        int i = 0;
+        while (true) {
+            i = json.indexOf(needle, i);
+            if (i < 0) return;
+            i += needle.length();
+            int j = json.indexOf('"', i);
+            if (j < 0) return;
+            String v = json.substring(i, j);
+            if (!v.isEmpty()) out.add(v);
+            i = j + 1;
+        }
+    }
+
     private void downloadAndCacheIeeeOui() {
         try {
             boolean ready = ouiReady.await(90, TimeUnit.SECONDS);
@@ -933,10 +1421,122 @@ public class Rat {
         return "00:00:00:00:00:00"; // FIX 10: this return was missing in previous version
     }
 
+
+    static boolean isLinuxOs() {
+        return System.getProperty("os.name", "").toLowerCase().contains("linux");
+    }
+
+    /**
+     * Port from gps_port.txt if present; otherwise auto-detect a USB/UART GPS
+     * dongle on Linux (Raspberry Pi typical paths). Returns null when nothing
+     * is configured and no Linux device node exists, so we skip the reader.
+     */
+    private static String resolveGpsPort() {
+        try {
+            Path gpsConf = Paths.get("gps_port.txt");
+            if (Files.exists(gpsConf)) {
+                String line = Files.readAllLines(gpsConf).stream()
+                    .filter(l -> !l.trim().isEmpty() && !l.startsWith("#"))
+                    .findFirst().orElse(null);
+                if (line != null && !line.trim().isEmpty()) {
+                    return line.trim();
+                }
+            }
+        } catch (Exception ignored) {}
+
+        if (isLinuxOs()) {
+            String[] candidates = {
+                "/dev/ttyUSB0", "/dev/ttyACM0", "/dev/serial0", "/dev/ttyAMA0"
+            };
+            for (String c : candidates) {
+                if (Files.exists(Paths.get(c))) return c;
+            }
+            return null;
+        }
+        return "COM3";
+    }
+
+    /** Hint shown when the capture stack fails to start — OS-specific. */
+    private static String captureSetupHint() {
+        if (isLinuxOs()) {
+            return "CHECK: 1) libpcap installed (libpcap0.8)  2) running as root (sudo)  3) adapter in monitor mode (e.g. sudo iw dev wlan0 set type monitor)";
+        }
+        return "CHECK: 1) Npcap installed  2) Running as Admin  3) Monitor-mode adapter present";
+    }
+
+    /** Print localhost and every non-loopback IPv4 so a headless Pi is reachable on the LAN. */
+    private void printDashboardUrls() {
+        println("DASHBOARD → http://localhost:" + httpPort);
+        try {
+            Enumeration<NetworkInterface> ifaces = NetworkInterface.getNetworkInterfaces();
+            if (ifaces == null) return;
+            while (ifaces.hasMoreElements()) {
+                NetworkInterface ni = ifaces.nextElement();
+                if (!ni.isUp() || ni.isLoopback()) continue;
+                for (InterfaceAddress ia : ni.getInterfaceAddresses()) {
+                    InetAddress addr = ia.getAddress();
+                    if (addr instanceof Inet4Address && !addr.isLoopbackAddress()) {
+                        println("DASHBOARD (LAN/" + ni.getName() + ") → http://"
+                                + addr.getHostAddress() + ":" + httpPort);
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+    }
+
+    // ── PCAP export CLI flag (PassiveScanner also honours pcap_config.txt) ──────
+    public void enablePcapExport() { this.pcapExportCli = true; }
+    public boolean isPcapExportCliEnabled() { return pcapExportCli; }
+
+    // ── Channel hopper CLI flag (PassiveScanner also honours hopper_config.txt) ─
+    public void enableChannelHop() { this.channelHopCli = true; }
+    public boolean isChannelHopCliEnabled() { return channelHopCli; }
+
+    public void enableApCsvExport()  { this.exportCsvCli  = true; }
+    public void enableApJsonExport() { this.exportJsonCli = true; }
+
+    public void enableSessionLog() { this.sessionLogCli = true; }
+
     // ── Main ────────────────────────────────────────────────────────────────────
     public static void main(String[] args) {
-        int port = args.length > 0 ? Integer.parseInt(args[0]) : 8080;
-        new Rat(port).start();
+        // PDF report generation uses java.awt.Color (no desktop UI). Force
+        // headless so a Pi / Docker / SSH session never tries to open a display.
+        System.setProperty("java.awt.headless", "true");
+        int port = 8080;
+        boolean pcapExport = false;
+        boolean channelHop = false;
+        boolean exportCsv  = false;
+        boolean exportJson = false;
+        boolean sessionLog = false;
+        for (String arg : args) {
+            if ("--pcap".equals(arg) || "--pcap-export".equals(arg)) {
+                pcapExport = true;
+            } else if ("--hop".equals(arg) || "--channel-hop".equals(arg)) {
+                channelHop = true;
+            } else if ("--export-csv".equals(arg)) {
+                exportCsv = true;
+            } else if ("--export-json".equals(arg)) {
+                exportJson = true;
+            } else if ("--export".equals(arg)) {
+                exportCsv = true;
+                exportJson = true;
+            } else if ("--session-log".equals(arg) || "--record".equals(arg)) {
+                sessionLog = true;
+            } else if (!arg.startsWith("-")) {
+                port = Integer.parseInt(arg);
+            } else {
+                System.err.println("Unknown option: " + arg);
+                System.err.println("Usage: java ... Rat [port] [--pcap] [--export-csv] [--export-json] [--hop] [--session-log]");
+                System.exit(1);
+            }
+        }
+        Rat rat = new Rat(port);
+        if (pcapExport) rat.enablePcapExport();
+        if (channelHop) rat.enableChannelHop();
+        if (exportCsv)  rat.enableApCsvExport();
+        if (exportJson) rat.enableApJsonExport();
+        if (sessionLog) rat.enableSessionLog();
+        rat.start();
         try { Thread.currentThread().join(); } catch (InterruptedException ignored) {}
     }
 
@@ -952,8 +1552,28 @@ public class Rat {
         public boolean positionRandom = false;
         public boolean isPositionResolved()           { return positionRandom; }
         public void    setPositionResolved(boolean v) { positionRandom = v; }
-        public long    lastSeen = System.currentTimeMillis();
-        public String  source   = "Unknown";
+        public long    firstSeen = System.currentTimeMillis();
+        public long    lastSeen  = System.currentTimeMillis();
+        public String  source    = "Unknown";
+        // Passive 4-way handshake telemetry (counts only — no key material)
+        public volatile boolean handshakeSeen  = false;
+        public volatile int     handshakeCount = 0;
+    }
+
+    /** Result of writing a discovered-AP snapshot to exports/. */
+    public static class ApExportResult {
+        public final Path csvPath;
+        public final Path jsonPath;
+        public final byte[] csvBytes;
+        public final byte[] jsonBytes;
+        public final int count;
+        ApExportResult(Path csvPath, Path jsonPath, byte[] csvBytes, byte[] jsonBytes, int count) {
+            this.csvPath = csvPath;
+            this.jsonPath = jsonPath;
+            this.csvBytes = csvBytes;
+            this.jsonBytes = jsonBytes;
+            this.count = count;
+        }
     }
 
 
@@ -969,7 +1589,7 @@ public class Rat {
 <script>window.API_TOKEN="__API_TOKEN__";</script>
 <meta charset="utf-8">
 <title>BLACK ICE v2 // SIGINT TERMINAL</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;900&family=Courier+Prime:ital,wght@0,400;0,700;1,400&family=Share+Tech+Mono&display=swap" rel="stylesheet">
 <style>
@@ -1054,6 +1674,7 @@ body { background:var(--bg); color:var(--amber); font-family:'Share Tech Mono',m
 .ap-meta span { color:var(--amber2); }
 .ap-meta .mac { color:var(--amber3); font-size:7px; }
 .open-tag { color:var(--red); font-size:7px; letter-spacing:2px; animation:crit-blink 0.8s step-end infinite; }
+.hs-tag { color:var(--cyan); font-size:7px; letter-spacing:2px; }
 .sig-bar { display:inline-flex; gap:1px; align-items:flex-end; height:8px; vertical-align:middle; }
 .sig-bar span { display:block; width:2px; background:currentColor; opacity:0.2; }
 .sig-bar span.on { opacity:1; }
@@ -1123,6 +1744,29 @@ body { background:var(--bg); color:var(--amber); font-family:'Share Tech Mono',m
 #export-strip { position:fixed; bottom:56px; left:8px; z-index:600; display:flex; gap:4px; }
 .exp-btn { font-family:'Share Tech Mono',monospace; font-size:7px; letter-spacing:3px; background:var(--bg2); color:var(--cyan); border:1px solid var(--cyan); padding:3px 8px; cursor:crosshair; text-transform:uppercase; transition:all 0.1s; }
 .exp-btn:hover { background:var(--cyan); color:var(--bg); }
+#replay-panel { position:fixed; top:48px; left:0; bottom:52px; width:300px; background:var(--bg2); border-right:2px solid var(--cyan); display:none; flex-direction:column; z-index:701; box-shadow:4px 0 20px rgba(0,180,204,0.15); }
+#replay-panel.open { display:flex; }
+.replay-head { padding:10px 14px 8px; border-bottom:1px solid var(--cyan); font-family:'Big Shoulders Display',sans-serif; font-size:13px; font-weight:700; letter-spacing:5px; color:var(--cyan); background:var(--bg3); flex-shrink:0; text-shadow:var(--glow-c); }
+.replay-body { padding:12px; display:flex; flex-direction:column; gap:10px; overflow:auto; }
+.replay-lbl { font-size:7px; letter-spacing:2px; color:var(--amber3); text-transform:uppercase; }
+.replay-row { display:flex; gap:6px; align-items:center; }
+.replay-sel { flex:1; width:100%; background:var(--bg); color:var(--cyan); border:1px solid var(--cyan); font-family:'Share Tech Mono',monospace; font-size:8px; padding:5px 6px; letter-spacing:1px; }
+.replay-sel option { background:var(--bg); }
+.replay-meta { font-size:8px; color:var(--bone2); letter-spacing:1px; line-height:1.6; min-height:32px; }
+.replay-btns { display:flex; gap:6px; flex-wrap:wrap; }
+.replay-btn { font-family:'Share Tech Mono',monospace; font-size:8px; letter-spacing:2px; background:transparent; color:var(--cyan); border:1px solid var(--cyan); padding:6px 8px; cursor:crosshair; text-transform:uppercase; transition:all 0.1s; flex:1; }
+.replay-btn:hover,.replay-btn.active { background:var(--cyan); color:var(--bg); }
+.replay-btn.live { color:var(--amber); border-color:var(--amber3); }
+.replay-btn.live:hover { background:var(--amber); color:var(--bg); }
+.replay-time { font-family:'Big Shoulders Display',sans-serif; font-size:22px; font-weight:700; letter-spacing:3px; color:var(--cyan); line-height:1; }
+.replay-time-sub { font-size:8px; color:var(--amber3); letter-spacing:2px; margin-top:3px; }
+input.replay-slider { width:100%; accent-color:#00b4cc; cursor:crosshair; }
+.replay-speeds { display:flex; gap:4px; flex-wrap:wrap; }
+.replay-spd { font-family:'Share Tech Mono',monospace; font-size:7px; letter-spacing:1px; background:transparent; color:var(--amber3); border:1px solid var(--amber3); padding:4px 6px; cursor:crosshair; text-transform:uppercase; }
+.replay-spd.active { color:var(--bg); background:var(--cyan); border-color:var(--cyan); }
+.replay-rec { font-size:8px; letter-spacing:2px; color:var(--amber3); }
+.replay-rec.on { color:var(--red); text-shadow:var(--glow-r); }
+.conn-badge.replay { color:var(--cyan); text-shadow:var(--glow-c); }
 .bracket { position:fixed; width:20px; height:20px; z-index:9993; pointer-events:none; }
 .bracket.tl { top:50px; left:1px; border-top:1px solid var(--amber2); border-left:1px solid var(--amber2); }
 .bracket.tr { top:50px; right:47px; border-top:1px solid var(--amber2); border-right:1px solid var(--amber2); }
@@ -1155,6 +1799,184 @@ body { background:var(--bg); color:var(--amber); font-family:'Share Tech Mono',m
 .granted-text { font-family:'Big Shoulders Display',sans-serif; font-size:clamp(40px,8vw,80px); font-weight:900; letter-spacing:10px; color:var(--amber); text-shadow:var(--glow); animation:granted-in 0.5s ease-out; }
 @keyframes granted-in { from{opacity:0;transform:scale(1.1);letter-spacing:30px}to{opacity:1;transform:none;letter-spacing:10px} }
 .granted-node { font-size:9px; letter-spacing:4px; color:var(--amber3); }
+
+/* drawer close + backdrop: hidden on desktop, used on narrow screens */
+#drawer-backdrop { display:none; position:fixed; inset:0; z-index:680; background:rgba(0,0,0,0.55); }
+.drawer-close { display:none; }
+@media (max-width: 1024px) {
+  html { -webkit-text-size-adjust:100%; }
+  body { cursor:auto; }
+  .hdr {
+    height:auto;
+    min-height:44px;
+    flex-wrap:wrap;
+    padding-top:env(safe-area-inset-top);
+  }
+  .hdr-brand { padding:6px 10px; }
+  .hdr-brand-name { font-size:16px; letter-spacing:3px; }
+  .hdr-brand-sub { letter-spacing:2px; font-size:6px; }
+  .hdr-stat { padding:4px 10px; }
+  .hdr-stat-lbl { letter-spacing:2px; }
+  .hdr-stat-val { font-size:18px; }
+  .threat-bar { padding:4px 10px; }
+  .threat-label { font-size:10px; letter-spacing:2px; padding:3px 8px 2px; }
+  .hdr-gps { padding:4px 10px; font-size:8px; letter-spacing:1px; }
+  #clock { padding:4px 10px; font-size:16px; letter-spacing:2px; }
+  .conn-badge { padding:4px 10px; }
+  .ctrl-strip {
+    top:auto;
+    left:0;
+    right:0;
+    width:100%;
+    bottom:var(--log-h, 52px);
+    flex-direction:row;
+    justify-content:stretch;
+    border-left:none;
+    border-bottom:none;
+    border-top:2px solid var(--amber3);
+    z-index:850;
+  }
+  .ctrl-btn {
+    flex:1;
+    width:auto;
+    height:48px;
+    min-height:48px;
+    min-width:0;
+    border-bottom:none;
+    border-right:1px solid var(--amber3);
+    font-size:16px;
+    flex-direction:column;
+    gap:1px;
+    padding:4px 0 8px;
+    -webkit-tap-highlight-color:transparent;
+    touch-action:manipulation;
+    cursor:pointer;
+  }
+  .ctrl-btn:last-child { border-right:none; }
+  .ctrl-btn[data-tip]:hover::after { content:none; display:none; }
+  .ctrl-btn[data-tip]::after {
+    content:attr(data-tip);
+    position:static;
+    transform:none;
+    background:none;
+    border:none;
+    box-shadow:none;
+    font-size:6px;
+    letter-spacing:0.4px;
+    padding:0;
+    color:inherit;
+    right:auto;
+    top:auto;
+    white-space:nowrap;
+    max-width:100%;
+    overflow:hidden;
+    text-overflow:ellipsis;
+  }
+  .ctrl-btn[data-tip="ROOM MODE"]::after { content:"ROOM"; }
+  .ctrl-btn[data-tip="CHANNELS"]::after { content:"CHAN"; }
+  .ctrl-btn[data-tip="TRI-FIX"]::after { content:"TRI"; }
+  #drawer-backdrop.show { display:block; }
+  #panel, #alert-panel, #chan-panel, #replay-panel {
+    top:var(--hdr-h, 48px);
+    left:0;
+    right:0;
+    width:100%;
+    max-width:100%;
+    bottom:calc(var(--log-h, 52px) + var(--ctrl-h, 48px));
+    z-index:860;
+  }
+  #panel, #alert-panel { border-left:none; }
+  #chan-panel, #replay-panel { border-right:none; }
+  .panel-head, .chan-head, .alert-head, .replay-head { position:relative; padding-right:42px; }
+  .drawer-close {
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    position:absolute;
+    right:6px;
+    top:50%;
+    transform:translateY(-50%);
+    width:36px;
+    height:36px;
+    min-width:36px;
+    border:1px solid var(--amber3);
+    background:transparent;
+    color:var(--amber);
+    font-size:14px;
+    cursor:pointer;
+    -webkit-tap-highlight-color:transparent;
+    touch-action:manipulation;
+    z-index:2;
+  }
+  #export-strip {
+    left:8px;
+    right:8px;
+    bottom:calc(var(--log-h, 52px) + var(--ctrl-h, 48px) + 8px);
+    flex-wrap:wrap;
+    gap:6px;
+  }
+  .exp-btn, .sv-btn, .a-add, .tri-btn, .replay-btn, .replay-spd, .rule-del {
+    min-height:40px;
+    padding:8px 12px;
+    font-size:10px;
+    letter-spacing:1px;
+    cursor:pointer;
+    touch-action:manipulation;
+    -webkit-tap-highlight-color:transparent;
+  }
+  .a-sel, .a-inp, .replay-sel, #tri-ap-sel {
+    min-height:40px;
+    font-size:12px;
+    padding:8px;
+  }
+  input.replay-slider { min-height:28px; touch-action:manipulation; }
+  #survey-legend {
+    left:8px;
+    right:8px;
+    bottom:calc(var(--log-h, 52px) + var(--ctrl-h, 48px) + 52px);
+    max-height:28vh;
+    overflow:auto;
+  }
+  #radar-legend {
+    left:8px;
+    bottom:calc(var(--log-h, 52px) + var(--ctrl-h, 48px) + 52px);
+  }
+  #tri-panel {
+    top:calc(var(--hdr-h, 48px) + 8px);
+    left:8px;
+    right:8px;
+    width:auto;
+    max-width:none;
+    transform:none;
+  }
+  #radar-canvas { top:var(--hdr-h, 48px); }
+  #log-strip {
+    height:auto;
+    min-height:44px;
+    max-height:64px;
+    padding:4px 10px calc(4px + env(safe-area-inset-bottom));
+  }
+  .bracket.tl { top:calc(var(--hdr-h, 48px) + 2px); }
+  .bracket.tr { top:calc(var(--hdr-h, 48px) + 2px); right:4px; }
+  .bracket.bl { bottom:calc(var(--log-h, 52px) + var(--ctrl-h, 48px) + 2px); }
+  .bracket.br { bottom:calc(var(--log-h, 52px) + var(--ctrl-h, 48px) + 2px); right:4px; }
+  .leaflet-control-zoom a { width:36px!important; height:36px!important; line-height:36px!important; font-size:18px!important; }
+  .leaflet-popup-content { min-width:0!important; max-width:calc(100vw - 32px)!important; }
+  .boot-bar-wrap { width:min(360px, 86vw); }
+  .boot-sub { letter-spacing:2px; text-align:center; padding:0 12px; }
+  .boot-log { width:92vw; font-size:9px; }
+}
+@media (max-width: 1024px) and (max-height: 500px) {
+  .hdr-brand-sub { display:none; }
+  .hdr-stat { padding:2px 8px; }
+  .hdr-stat-val { font-size:16px; }
+  #log-strip { max-height:36px; }
+}
+@media (max-width: 1024px), (prefers-reduced-motion: reduce) {
+  #crt-flicker, #crt-sweep, #noise-canvas { display:none!important; animation:none!important; }
+  #crt-scanlines { opacity:0.55; }
+  .boot-logo { animation:none; }
+}
 </style>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 </head><body>
@@ -1184,6 +2006,8 @@ body { background:var(--bg); color:var(--amber); font-family:'Share Tech Mono',m
 </div>
 
 <div id="export-strip">
+  <button class="exp-btn" onclick="window.open('/api/v1/export/aps.csv?token='+encodeURIComponent(window.API_TOKEN),'_blank')">&#8659; AP CSV</button>
+  <button class="exp-btn" onclick="window.open('/api/v1/export/aps.json?token='+encodeURIComponent(window.API_TOKEN),'_blank')">&#8659; AP JSON</button>
   <button class="exp-btn" onclick="window.open('/api/v1/export/kml?token='+encodeURIComponent(window.API_TOKEN),'_blank')">&#8659; KML</button>
   <button class="exp-btn" onclick="window.open('/api/v1/export/gpx?token='+encodeURIComponent(window.API_TOKEN),'_blank')">&#8659; GPX</button>
   <button class="exp-btn" onclick="generateReport()">&#8659; PDF</button>
@@ -1199,6 +2023,7 @@ body { background:var(--bg); color:var(--amber); font-family:'Share Tech Mono',m
   <div id="clock">00:00:00</div>
   <div class="hdr-right"><div class="conn-badge wait" id="conn-badge"><div class="conn-dot"></div><span id="conn-txt">CONNECTING</span></div></div>
 </div>
+<div id="drawer-backdrop" onclick="closeMobileDrawers()"></div>
 <div class="ctrl-strip">
   <button class="ctrl-btn" id="btn-targets"  onclick="togglePanel()"      data-tip="TARGETS">&#9776;</button>
   <button class="ctrl-btn" id="btn-channels" onclick="toggleChanPanel()"  data-tip="CHANNELS">&#9636;</button>
@@ -1206,14 +2031,15 @@ body { background:var(--bg); color:var(--amber); font-family:'Share Tech Mono',m
   <button class="ctrl-btn" id="btn-tri"      onclick="toggleTriPanel()"   data-tip="TRI-FIX">&#9651;</button>
   <button class="ctrl-btn" id="btn-survey"   onclick="toggleSurvey()"     data-tip="SURVEY">&#9678;</button>
   <button class="ctrl-btn" id="btn-room"     onclick="toggleRoomMode()"   data-tip="ROOM MODE">&#9673;</button>
+  <button class="ctrl-btn" id="btn-replay"   onclick="toggleReplayPanel()" data-tip="REPLAY">&#8634;</button>
 </div>
 <div id="panel">
-  <div class="panel-head"><span>// ACCESS POINTS</span><div class="panel-count" id="pcnt">0</div></div>
+  <div class="panel-head"><span>// ACCESS POINTS</span><div class="panel-count" id="pcnt">0</div><button type="button" class="drawer-close" onclick="closeMobileDrawers()" aria-label="Close">&#x2715;</button></div>
   <div id="ap-list"></div>
 </div>
-<div id="chan-panel"><div class="chan-head">// CHANNEL MAP</div><canvas id="chan-canvas"></canvas></div>
+<div id="chan-panel"><div class="chan-head">// CHANNEL MAP<button type="button" class="drawer-close" onclick="closeMobileDrawers()" aria-label="Close">&#x2715;</button></div><canvas id="chan-canvas"></canvas></div>
 <div id="alert-panel">
-  <div class="alert-head">// ALERT ENGINE</div>
+  <div class="alert-head">// ALERT ENGINE<button type="button" class="drawer-close" onclick="closeMobileDrawers()" aria-label="Close">&#x2715;</button></div>
   <div id="alert-fired-log"></div>
   <div id="alert-rule-list"></div>
   <div class="alert-form">
@@ -1237,6 +2063,33 @@ body { background:var(--bg); color:var(--amber); font-family:'Share Tech Mono',m
   <div class="tri-status" id="tri-status">Move to position A, select AP, then MARK.</div>
   <div class="tri-btns"><button class="tri-btn" onclick="triMark()">&#9654; MARK</button><button class="tri-btn cancel" onclick="triCancel()">&#x2715; ABORT</button></div>
 </div>
+<div id="replay-panel">
+  <div class="replay-head">// SESSION REPLAY<button type="button" class="drawer-close" onclick="closeMobileDrawers()" aria-label="Close">&#x2715;</button></div>
+  <div class="replay-body">
+    <div class="replay-rec" id="replay-rec">REC: IDLE</div>
+    <div class="replay-lbl">Saved sessions</div>
+    <div class="replay-row">
+      <select class="replay-sel" id="replay-sel" onchange="loadReplaySession()"><option value="">-- select session --</option></select>
+      <button class="replay-btn" style="flex:0 0 auto;padding:6px 8px;" onclick="refreshReplayList()" title="Refresh">&#8635;</button>
+    </div>
+    <div class="replay-meta" id="replay-meta">No session loaded. Enable recording with --session-log, then pick a file to replay.</div>
+    <div class="replay-time" id="replay-clock">00:00:00</div>
+    <div class="replay-time-sub" id="replay-clock-sub">-- / --</div>
+    <input class="replay-slider" id="replay-slider" type="range" min="0" max="0" value="0" disabled oninput="scrubReplay(this.value)"/>
+    <div class="replay-btns">
+      <button class="replay-btn" id="replay-play" onclick="toggleReplayPlay()">&#9654; PLAY</button>
+      <button class="replay-btn live" onclick="exitReplay()">&#9632; LIVE</button>
+    </div>
+    <div class="replay-lbl">Playback speed</div>
+    <div class="replay-speeds">
+      <button class="replay-spd" data-spd="1" onclick="setReplaySpeed(1)">1x</button>
+      <button class="replay-spd" data-spd="2" onclick="setReplaySpeed(2)">2x</button>
+      <button class="replay-spd active" data-spd="4" onclick="setReplaySpeed(4)">4x</button>
+      <button class="replay-spd" data-spd="8" onclick="setReplaySpeed(8)">8x</button>
+      <button class="replay-spd" data-spd="16" onclick="setReplaySpeed(16)">16x</button>
+    </div>
+  </div>
+</div>
 <div id="log-strip">
   <div class="log-row"><span class="log-ts">[BOOT]</span><span class="log-tag">[SYS]</span><span class="log-msg">BLACK ICE v2 — INITIALIZING SIGINT TERMINAL</span></div>
   <div class="log-row"><span class="log-ts">[SYS]</span><span class="log-tag">[NET]</span><span class="log-msg warn">AWAITING 802.11 FRAME CAPTURE</span></div>
@@ -1251,7 +2104,7 @@ body { background:var(--bg); color:var(--amber); font-family:'Share Tech Mono',m
 </div>
 <script>
 'use strict';
-(function(){const c=document.getElementById('noise-canvas');const ctx=c.getContext('2d');function resize(){c.width=innerWidth;c.height=innerHeight;}resize();window.addEventListener('resize',resize);function drawNoise(){const img=ctx.createImageData(c.width,c.height);const d=img.data;for(let i=0;i<d.length;i+=4){const v=Math.random()*60|0;d[i]=v*1.2;d[i+1]=v*0.7;d[i+2]=0;d[i+3]=255;}ctx.putImageData(img,0,0);}drawNoise();setInterval(drawNoise,120);})();
+(function(){const c=document.getElementById('noise-canvas');if(!c)return;const ctx=c.getContext('2d');const lite=window.matchMedia('(max-width: 1024px), (prefers-reduced-motion: reduce)');let timer=null;function resize(){c.width=innerWidth;c.height=innerHeight;}function drawNoise(){const img=ctx.createImageData(c.width,c.height);const d=img.data;for(let i=0;i<d.length;i+=4){const v=Math.random()*60|0;d[i]=v*1.2;d[i+1]=v*0.7;d[i+2]=0;d[i+3]=255;}ctx.putImageData(img,0,0);}function start(){if(lite.matches){if(timer){clearInterval(timer);timer=null;}c.style.display='none';return;}c.style.display='';resize();drawNoise();if(!timer)timer=setInterval(drawNoise,120);}window.addEventListener('resize',()=>{if(!lite.matches)resize();start();});if(lite.addEventListener)lite.addEventListener('change',start);else if(lite.addListener)lite.addListener(start);start();})();
 function updateClock(){const n=new Date();document.getElementById('clock').textContent=String(n.getHours()).padStart(2,'0')+':'+String(n.getMinutes()).padStart(2,'0')+':'+String(n.getSeconds()).padStart(2,'0');}setInterval(updateClock,1000);updateClock();
 const map=L.map('map',{zoomControl:true,attributionControl:false}).setView([-15.3875,28.3228],15);
 const tileSources=['https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}','https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png'];
@@ -1268,21 +2121,24 @@ const MM={_m:{},_rings:{},_mode:'map',setMode(m){this._mode=m;},has(k){return k 
 function isOpenNet(ap){const s=ap.security||'';return s.toUpperCase().includes('OPEN')||s==='';}
 const logEl=document.getElementById('log-strip');
 function addLog(tag,msg,type){const ts=new Date();const t=String(ts.getHours()).padStart(2,'0')+':'+String(ts.getMinutes()).padStart(2,'0')+':'+String(ts.getSeconds()).padStart(2,'0');const d=document.createElement('div');d.className='log-row';const cls=type==='crit'?'crit':type==='warn'?'warn':type==='info'?'info':'';d.innerHTML=`<span class="log-ts">[${t}]</span><span class="log-tag">[${tag}]</span><span class="log-msg ${cls}">${msg}</span>`;logEl.appendChild(d);while(logEl.children.length>3)logEl.removeChild(logEl.firstChild);}
-function makePopup(ap){const isOpen=isOpenNet(ap);const isWPA3=(ap.security||'').includes('WPA3');const isWPA2=(ap.security||'').includes('WPA2')&&!isWPA3;const hidden=!ap.ssid||ap.ssid==='<hidden>';let threat=0;if(isOpen)threat+=60;if(hidden)threat+=15;if(ap.signal>-55)threat+=15;if(ap.channel===0)threat+=10;threat=Math.min(threat,100);const tc=threat>=60?'#c41e0a':threat>=30?'#ffcc00':'#ff8c00';const mc=isOpen?'#c41e0a':isWPA3?'#00b4cc':'#ff8c00';const sc=ap.signal>-55?'#ff8c00':ap.signal>-70?'#ffcc00':'#c41e0a';const sig=Math.max(0,Math.min(100,(ap.signal+100)*2));const band=ap.channel>=36?'5GHz':ap.channel>0?'2.4GHz':'---';const ssid=hidden?'[ HIDDEN ]':(ap.ssid||'---');const enc=isOpen?`<span style="color:#c41e0a;border:1px solid #c41e0a;padding:1px 6px;font-size:7px;letter-spacing:2px;">UNENCRYPTED</span>`:isWPA3?`<span style="color:#00b4cc;border:1px solid #00b4cc;padding:1px 6px;font-size:7px;letter-spacing:2px;">WPA3</span>`:isWPA2?`<span style="color:#ff8c00;border:1px solid #ff8c00;padding:1px 6px;font-size:7px;letter-spacing:2px;">WPA2</span>`:`<span style="color:#ffcc00;border:1px solid #ffcc00;padding:1px 6px;font-size:7px;letter-spacing:2px;">LEGACY</span>`;const spark=drawSparkline(ap.bssid,240,24);return `<div style="background:#0e0c09;border:1px solid ${mc}88;font-family:'Share Tech Mono',monospace;overflow:hidden;min-width:260px;"><div style="background:${mc}14;border-bottom:1px solid ${mc}44;padding:9px 12px 7px;"><div style="font-family:'Big Shoulders Display',sans-serif;font-size:18px;font-weight:700;letter-spacing:4px;color:${mc};text-shadow:0 0 8px ${mc}88;">${ssid}</div><div style="font-size:8px;color:#7a5500;letter-spacing:1px;margin-top:2px;">${ap.bssid||'---'}</div><div style="margin-top:5px;">${enc}</div></div><div style="padding:7px 12px;border-bottom:1px solid #2a1500;"><div style="display:flex;justify-content:space-between;margin-bottom:3px;"><span style="font-size:7px;color:#7a5500;letter-spacing:2px;">SIGNAL STRENGTH</span><span style="font-size:9px;color:${sc};font-family:'Big Shoulders Display',sans-serif;letter-spacing:1px;">${ap.signal} dBm</span></div><div style="height:3px;background:#0e0c09;border:1px solid #2a1500;overflow:hidden;"><div style="height:100%;width:${sig}%;background:${sc};box-shadow:0 0 4px ${sc};"></div></div><div style="margin-top:5px;">${spark}</div></div><div style="padding:6px 12px;border-bottom:1px solid ${tc}33;background:${tc}0d;"><div style="display:flex;justify-content:space-between;"><span style="font-size:7px;color:#7a5500;letter-spacing:2px;">THREAT SCORE</span><span style="font-family:'Big Shoulders Display',sans-serif;font-size:12px;color:${tc};letter-spacing:3px;">${threat>=60?'HIGH':threat>=30?'MED':'LOW'} — ${threat}</span></div><div style="height:2px;background:#0e0c09;margin-top:4px;overflow:hidden;"><div style="height:100%;width:${threat}%;background:${tc};"></div></div></div><div style="padding:7px 12px 9px;font-size:8px;line-height:1.8;"><table style="width:100%;border-collapse:collapse;"><tr><td style="color:#7a5500;padding-right:12px;letter-spacing:2px;white-space:nowrap;font-size:7px;">VENDOR</td><td style="color:#00b4cc;">${ap.vendor||'UNKNOWN'}</td></tr><tr><td style="color:#7a5500;letter-spacing:2px;font-size:7px;">CHANNEL</td><td style="color:#ff8c00;">${ap.channel>0?ap.channel:'?'} <span style="color:#7a5500;">${band}</span></td></tr><tr><td style="color:#7a5500;letter-spacing:2px;font-size:7px;">ENCRYPT</td><td style="color:${mc};">${ap.security||'NONE'}</td></tr><tr><td style="color:#7a5500;letter-spacing:2px;font-size:7px;">SOURCE</td><td style="color:#a89880;">${ap.source||'---'}</td></tr><tr><td style="color:#7a5500;letter-spacing:2px;font-size:7px;">COORDS</td><td style="color:#7a5500;font-size:7px;">${ap.lat?ap.lat.toFixed(5):'---'}, ${ap.lon?ap.lon.toFixed(5):'---'}</td></tr></table></div><div style="border-top:1px solid #2a1500;padding:4px 12px;display:flex;justify-content:space-between;background:#080604;"><span style="font-size:7px;color:#3a2800;letter-spacing:3px;">BLACK ICE v2</span><span style="font-size:7px;color:${mc}88;letter-spacing:2px;">NIGHTFALL35</span></div></div>`;}
+function makePopup(ap){const isOpen=isOpenNet(ap);const isWPA3=(ap.security||'').includes('WPA3');const isWPA2=(ap.security||'').includes('WPA2')&&!isWPA3;const hidden=!ap.ssid||ap.ssid==='<hidden>';let threat=0;if(isOpen)threat+=60;if(hidden)threat+=15;if(ap.signal>-55)threat+=15;if(ap.channel===0)threat+=10;threat=Math.min(threat,100);const tc=threat>=60?'#c41e0a':threat>=30?'#ffcc00':'#ff8c00';const mc=isOpen?'#c41e0a':isWPA3?'#00b4cc':'#ff8c00';const sc=ap.signal>-55?'#ff8c00':ap.signal>-70?'#ffcc00':'#c41e0a';const sig=Math.max(0,Math.min(100,(ap.signal+100)*2));const band=ap.channel>=36?'5GHz':ap.channel>0?'2.4GHz':'---';const ssid=hidden?'[ HIDDEN ]':(ap.ssid||'---');const enc=isOpen?`<span style="color:#c41e0a;border:1px solid #c41e0a;padding:1px 6px;font-size:7px;letter-spacing:2px;">UNENCRYPTED</span>`:isWPA3?`<span style="color:#00b4cc;border:1px solid #00b4cc;padding:1px 6px;font-size:7px;letter-spacing:2px;">WPA3</span>`:isWPA2?`<span style="color:#ff8c00;border:1px solid #ff8c00;padding:1px 6px;font-size:7px;letter-spacing:2px;">WPA2</span>`:`<span style="color:#ffcc00;border:1px solid #ffcc00;padding:1px 6px;font-size:7px;letter-spacing:2px;">LEGACY</span>`;const spark=drawSparkline(ap.bssid,240,24);return `<div style="background:#0e0c09;border:1px solid ${mc}88;font-family:'Share Tech Mono',monospace;overflow:hidden;min-width:260px;"><div style="background:${mc}14;border-bottom:1px solid ${mc}44;padding:9px 12px 7px;"><div style="font-family:'Big Shoulders Display',sans-serif;font-size:18px;font-weight:700;letter-spacing:4px;color:${mc};text-shadow:0 0 8px ${mc}88;">${ssid}</div><div style="font-size:8px;color:#7a5500;letter-spacing:1px;margin-top:2px;">${ap.bssid||'---'}</div><div style="margin-top:5px;">${enc}</div></div><div style="padding:7px 12px;border-bottom:1px solid #2a1500;"><div style="display:flex;justify-content:space-between;margin-bottom:3px;"><span style="font-size:7px;color:#7a5500;letter-spacing:2px;">SIGNAL STRENGTH</span><span style="font-size:9px;color:${sc};font-family:'Big Shoulders Display',sans-serif;letter-spacing:1px;">${ap.signal} dBm</span></div><div style="height:3px;background:#0e0c09;border:1px solid #2a1500;overflow:hidden;"><div style="height:100%;width:${sig}%;background:${sc};box-shadow:0 0 4px ${sc};"></div></div><div style="margin-top:5px;">${spark}</div></div><div style="padding:6px 12px;border-bottom:1px solid ${tc}33;background:${tc}0d;"><div style="display:flex;justify-content:space-between;"><span style="font-size:7px;color:#7a5500;letter-spacing:2px;">THREAT SCORE</span><span style="font-family:'Big Shoulders Display',sans-serif;font-size:12px;color:${tc};letter-spacing:3px;">${threat>=60?'HIGH':threat>=30?'MED':'LOW'} — ${threat}</span></div><div style="height:2px;background:#0e0c09;margin-top:4px;overflow:hidden;"><div style="height:100%;width:${threat}%;background:${tc};"></div></div></div><div style="padding:7px 12px 9px;font-size:8px;line-height:1.8;"><table style="width:100%;border-collapse:collapse;"><tr><td style="color:#7a5500;padding-right:12px;letter-spacing:2px;white-space:nowrap;font-size:7px;">VENDOR</td><td style="color:#00b4cc;">${ap.vendor||'UNKNOWN'}</td></tr><tr><td style="color:#7a5500;letter-spacing:2px;font-size:7px;">CHANNEL</td><td style="color:#ff8c00;">${ap.channel>0?ap.channel:'?'} <span style="color:#7a5500;">${band}</span></td></tr><tr><td style="color:#7a5500;letter-spacing:2px;font-size:7px;">ENCRYPT</td><td style="color:${mc};">${ap.security||'NONE'}</td></tr><tr><td style="color:#7a5500;letter-spacing:2px;font-size:7px;">HANDSHAKE</td><td style="color:${ap.handshakeSeen?'#00b4cc':'#7a5500'};">${ap.handshakeSeen?('SEEN ×'+(ap.handshakeCount||1)):'NOT SEEN'}</td></tr><tr><td style="color:#7a5500;letter-spacing:2px;font-size:7px;">SOURCE</td><td style="color:#a89880;">${ap.source||'---'}</td></tr><tr><td style="color:#7a5500;letter-spacing:2px;font-size:7px;">COORDS</td><td style="color:#7a5500;font-size:7px;">${ap.lat?ap.lat.toFixed(5):'---'}, ${ap.lon?ap.lon.toFixed(5):'---'}</td></tr></table></div><div style="border-top:1px solid #2a1500;padding:4px 12px;display:flex;justify-content:space-between;background:#080604;"><span style="font-size:7px;color:#3a2800;letter-spacing:3px;">BLACK ICE v2</span><span style="font-size:7px;color:${mc}88;letter-spacing:2px;">NIGHTFALL35</span></div></div>`;}
 function updateSigHistory(aps){const now=Date.now();for(const[k,ap]of Object.entries(aps)){if(!sigHistory[k])sigHistory[k]=[];sigHistory[k].push({t:now,rssi:ap.signal});sigHistory[k]=sigHistory[k].filter(e=>now-e.t<SIG_HIST_MS);}}
 function drawSparkline(bssid,w,h){const hist=sigHistory[bssid];if(!hist||hist.length<2)return'';const now=Date.now();const minR=-95,maxR=-20;const pts=hist.map(e=>{const x=(Math.max(0,e.t-(now-SIG_HIST_MS))/SIG_HIST_MS)*w;const y=h-((e.rssi-minR)/(maxR-minR))*h;return x.toFixed(1)+','+y.toFixed(1);}).join(' ');const last=hist[hist.length-1].rssi;const col=last>-55?'#ff8c00':last>-70?'#ffcc00':'#c41e0a';return `<svg width="${w}" height="${h}" style="display:block;"><polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.2" opacity="0.8"/><line x1="0" y1="${h/2}" x2="${w}" y2="${h/2}" stroke="#3a280066" stroke-width="1" stroke-dasharray="2,4"/></svg>`;}
 function sigBars(dbm,col){const lvl=dbm>-55?4:dbm>-65?3:dbm>-75?2:1;let h=`<span class="sig-bar" style="color:${col}">`;for(let i=1;i<=4;i++)h+=`<span${i<=lvl?' class="on"':''}></span>`;return h+'</span>';}
-function updateDisplay(aps){allAps=aps;const total=Object.keys(aps).length;document.getElementById('cnt').textContent=String(total).padStart(3,'0');const openCount=Object.values(aps).filter(a=>isOpenNet(a)).length;document.getElementById('ocnt').textContent=openCount;const b=document.getElementById('threat-badge');if(openCount===0){b.textContent='NOMINAL';b.className='threat-label nom';}else if(openCount<3){b.textContent='ELEVATED';b.className='threat-label elv';}else{b.textContent='!! CRITICAL';b.className='threat-label crit';}updateSigHistory(aps);if(panelOpen)renderPanel();if(chanOpen)drawChannelChart(aps);if(!roomMode){MM.flush();for(const[k,ap]of Object.entries(aps)){if(MM.isReal(k))MM.update(k,ap);else{addLog('SIG',(ap.ssid||'<HIDDEN>')+' '+ap.signal+'dBm',isOpenNet(ap)?'crit':'info');MM.add(k,ap,map);}}for(const k of MM.keys()){if(!aps[k])MM.remove(k,map);}}else{for(const[k,ap]of Object.entries(aps)){if(!MM.has(k)){addLog('SIG',(ap.ssid||'<HIDDEN>')+' '+ap.signal+'dBm',isOpenNet(ap)?'crit':'info');MM.add(k,ap,map);}}}}
-function togglePanel(){panelOpen=!panelOpen;document.getElementById('panel').classList.toggle('open',panelOpen);document.getElementById('btn-targets').classList.toggle('active',panelOpen);if(panelOpen)renderPanel();}
-function renderPanel(){const list=document.getElementById('ap-list');const entries=Object.entries(allAps).sort((a,b)=>b[1].signal-a[1].signal);document.getElementById('pcnt').textContent=entries.length;list.innerHTML='';for(const[k,ap]of entries){const isOpen=isOpenNet(ap);const sc=ap.signal>-65?'var(--amber)':ap.signal>-80?'#ffcc00':'var(--red)';const d=document.createElement('div');d.className='ap-item'+(isOpen?' open-net':'');d.innerHTML=`<div class="ap-ssid${isOpen?' open-ssid':''}">${isOpen?'&#9888; ':''}${ap.ssid||'&lt;HIDDEN&gt;'}${isOpen?' <span class="open-tag">[OPEN]</span>':''}</div><div class="ap-meta"><span class="mac">${ap.bssid}</span><span>${sigBars(ap.signal,sc)} ${ap.signal}dBm</span><span>CH${ap.channel}</span><span>${ap.vendor||'?'}</span></div>`;d.onclick=()=>{if(!roomMode){MM.flyTo(k,map,ap);MM.openPopup(k);}};list.appendChild(d);}}
-function toggleChanPanel(){chanOpen=!chanOpen;document.getElementById('chan-panel').classList.toggle('open',chanOpen);document.getElementById('btn-channels').classList.toggle('active',chanOpen);if(chanOpen)drawChannelChart(allAps);}
+function updateDisplay(aps){for(const[k,ap]of Object.entries(aps)){const prev=allAps[k];if(ap.handshakeCount&&(!prev||(ap.handshakeCount||0)>(prev.handshakeCount||0))){addLog('HS',(ap.ssid||'<HIDDEN>')+' 4-WAY COMPLETE ×'+ap.handshakeCount,'info');}}allAps=aps;const total=Object.keys(aps).length;document.getElementById('cnt').textContent=String(total).padStart(3,'0');const openCount=Object.values(aps).filter(a=>isOpenNet(a)).length;document.getElementById('ocnt').textContent=openCount;const b=document.getElementById('threat-badge');if(openCount===0){b.textContent='NOMINAL';b.className='threat-label nom';}else if(openCount<3){b.textContent='ELEVATED';b.className='threat-label elv';}else{b.textContent='!! CRITICAL';b.className='threat-label crit';}updateSigHistory(aps);if(panelOpen)renderPanel();if(chanOpen)drawChannelChart(aps);if(!roomMode){MM.flush();for(const[k,ap]of Object.entries(aps)){if(MM.isReal(k))MM.update(k,ap);else{addLog('SIG',(ap.ssid||'<HIDDEN>')+' '+ap.signal+'dBm',isOpenNet(ap)?'crit':'info');MM.add(k,ap,map);}}for(const k of MM.keys()){if(!aps[k])MM.remove(k,map);}}else{for(const[k,ap]of Object.entries(aps)){if(!MM.has(k)){addLog('SIG',(ap.ssid||'<HIDDEN>')+' '+ap.signal+'dBm',isOpenNet(ap)?'crit':'info');MM.add(k,ap,map);}}}}
+function isMobileDash(){return window.matchMedia('(max-width: 1024px)').matches;}
+function syncDrawerBackdrop(){const bd=document.getElementById('drawer-backdrop');if(bd)bd.classList.toggle('show',isMobileDash()&&(panelOpen||chanOpen||alertOpen||replayOpen));}
+function closeMobileDrawers(){panelOpen=false;chanOpen=false;alertOpen=false;replayOpen=false;const ids=[['panel','btn-targets'],['chan-panel','btn-channels'],['alert-panel','btn-alerts'],['replay-panel','btn-replay']];ids.forEach(([p,b])=>{const el=document.getElementById(p);if(el)el.classList.remove('open');const btn=document.getElementById(b);if(btn)btn.classList.remove('active');});syncDrawerBackdrop();}
+function togglePanel(){const next=!panelOpen;if(isMobileDash()&&next)closeMobileDrawers();panelOpen=next;document.getElementById('panel').classList.toggle('open',panelOpen);document.getElementById('btn-targets').classList.toggle('active',panelOpen);syncDrawerBackdrop();if(panelOpen)renderPanel();}
+function renderPanel(){const list=document.getElementById('ap-list');const entries=Object.entries(allAps).sort((a,b)=>b[1].signal-a[1].signal);document.getElementById('pcnt').textContent=entries.length;list.innerHTML='';for(const[k,ap]of entries){const isOpen=isOpenNet(ap);const sc=ap.signal>-65?'var(--amber)':ap.signal>-80?'#ffcc00':'var(--red)';const d=document.createElement('div');d.className='ap-item'+(isOpen?' open-net':'');d.innerHTML=`<div class="ap-ssid${isOpen?' open-ssid':''}">${isOpen?'&#9888; ':''}${ap.ssid||'&lt;HIDDEN&gt;'}${isOpen?' <span class="open-tag">[OPEN]</span>':''}${ap.handshakeSeen?' <span class="hs-tag">[HS ×'+ap.handshakeCount+']</span>':''}</div><div class="ap-meta"><span class="mac">${ap.bssid}</span><span>${sigBars(ap.signal,sc)} ${ap.signal}dBm</span><span>CH${ap.channel}</span><span>${ap.vendor||'?'}</span></div>`;d.onclick=()=>{if(!roomMode){MM.flyTo(k,map,ap);MM.openPopup(k);}};list.appendChild(d);}}
+function toggleChanPanel(){const next=!chanOpen;if(isMobileDash()&&next)closeMobileDrawers();chanOpen=next;document.getElementById('chan-panel').classList.toggle('open',chanOpen);document.getElementById('btn-channels').classList.toggle('active',chanOpen);syncDrawerBackdrop();if(chanOpen)drawChannelChart(allAps);}
 function drawChannelChart(aps){const canvas=document.getElementById('chan-canvas');const ctx=canvas.getContext('2d');const W=canvas.offsetWidth||224,H=canvas.offsetHeight||300;canvas.width=W;canvas.height=H;ctx.fillStyle='#080604';ctx.fillRect(0,0,W,H);const counts={};for(const ap of Object.values(aps)){const ch=ap.channel||0;counts[ch]=(counts[ch]||0)+1;}const ch24=[1,2,3,4,5,6,7,8,9,10,11,12,13,14].map(c=>({ch:c,n:counts[c]||0}));const ch5=[36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,149,153,157,161,165].map(c=>({ch:c,n:counts[c]||0}));const maxN=Math.max(1,...Object.values(counts));function section(chs,sy,label,col){ctx.font='700 8px Big Shoulders Display,monospace';ctx.fillStyle=col;ctx.fillText(label,6,sy-4);const bw=Math.floor((W-20)/chs.length)-1;chs.forEach((c,i)=>{const x=10+i*(bw+1),bh=c.n>0?Math.max(3,Math.floor((c.n/maxN)*55)):0,y=sy+58-bh;if(c.n>0){const g=ctx.createLinearGradient(0,y,0,sy+58);g.addColorStop(0,col);g.addColorStop(1,col+'44');ctx.fillStyle=g;ctx.fillRect(x,y,bw,bh);ctx.shadowColor=col;ctx.shadowBlur=3;ctx.fillRect(x,y,bw,1);ctx.shadowBlur=0;}else{ctx.fillStyle='#2a1500';ctx.fillRect(x,sy+52,bw,5);}if(bw>=7){ctx.font='6px Share Tech Mono,monospace';ctx.fillStyle=c.n>0?col:'#3a2800';ctx.fillText(c.ch,x+bw/2-(c.ch>9?4:2),sy+70);}if(c.n>0){ctx.font='700 7px Share Tech Mono,monospace';ctx.fillStyle=col;ctx.fillText(c.n,x+bw/2-3,y-2);}});}section(ch24,18,'2.4 GHz','#ff8c00');section(ch5,118,'5 GHz','#00b4cc');const ov=ch24.filter(c=>c.n>0&&![1,6,11].includes(c.ch));if(ov.length>0){ctx.font='7px Share Tech Mono,monospace';ctx.fillStyle='#c41e0a';ctx.fillText('\\u26a0 CH OVERLAP: '+ov.map(c=>c.ch).join(','),6,104);}ctx.font='8px Share Tech Mono,monospace';ctx.fillStyle='#7a5500';ctx.fillText('TOTAL: '+Object.values(aps).length+' APs',6,H-6);}
 function makeOpIcon(gps){const col=gps?'#00b4cc':'#ff8c00';return L.divIcon({html:`<div style="width:14px;height:14px;border:2px solid ${col};background:${col}22;box-shadow:0 0 10px ${col}88;animation:pip-pulse 1.2s infinite;position:relative;"><div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:4px;height:4px;background:${col};"></div></div>`,iconSize:[14,14],iconAnchor:[7,7],className:''});}
 function updateOpMarker(lat,lon,gps){if(!opMarker){opMarker=L.marker([lat,lon],{icon:makeOpIcon(gps),zIndexOffset:9000}).addTo(map);opMarker.bindPopup(`<div style="font-family:'Share Tech Mono',monospace;background:#0e0c09;border:1px solid #ff8c00;padding:8px;font-size:9px;color:#ff8c00;letter-spacing:2px;">OPERATOR<br><span style="color:#7a5500;font-size:8px;">${gps?'HARDWARE GPS':'BROWSER'}</span><br><span style="font-size:7px;color:#3a2800;">${lat.toFixed(6)}, ${lon.toFixed(6)}</span></div>`);}else{opMarker.setLatLng([lat,lon]);opMarker.setIcon(makeOpIcon(gps));}window._opLat=lat;window._opLon=lon;}
 if(navigator.geolocation){navigator.geolocation.watchPosition(pos=>{if(gpsLocked)return;const{latitude:lat,longitude:lon}=pos.coords;window._opLat=lat;window._opLon=lon;map.setView([lat,lon],16);updateOpMarker(lat,lon,false);addLog('GPS','BROWSER LOC: '+lat.toFixed(4)+','+lon.toFixed(4),'info');},()=>addLog('GPS','BROWSER GPS UNAVAILABLE','warn'),{enableHighAccuracy:true,maximumAge:5000});}
-function setConn(s){const el=document.getElementById('conn-badge');const txt=document.getElementById('conn-txt');el.className='conn-badge '+s;txt.textContent=s==='live'?'LIVE':s==='disc'?'OFFLINE':'CONNECTING';}
+function setConn(s){const el=document.getElementById('conn-badge');const txt=document.getElementById('conn-txt');el.className='conn-badge '+s;txt.textContent=s==='live'?'LIVE':s==='disc'?'OFFLINE':s==='replay'?'REPLAY':'CONNECTING';}
 let evt=null;
-function connect(){if(evt)evt.close();setConn('wait');evt=new EventSource('/sse');evt.onopen=()=>{setConn('live');reconnects=0;addLog('SSE','STREAM ESTABLISHED','info');};evt.onmessage=e=>{try{const d=JSON.parse(e.data);if(d.type==='alert'){handleAlertEvent(d);return;}if(d.type==='full'){if(d.operator)updateOp(d.operator);updateDisplay(d.aps);if(d.geo)document.getElementById('local-db-cnt').textContent=d.geo.localBssids;if(d.survey){const op=d.operator||{};ingestSurvey(d.aps,op.lat,op.lon,d.survey.readings);if(d.survey.active&&!surveyMode){document.getElementById('btn-survey').classList.add('active');document.getElementById('survey-legend').classList.add('active');surveyMode=true;}}}}catch(err){addLog('ERR','PARSE: '+err.message,'crit');}};evt.onerror=()=>{setConn('disc');evt.close();if(reconnects<10){reconnects++;addLog('SSE','RECONNECT '+reconnects+'/10...','warn');setTimeout(connect,2000+reconnects*500);}else addLog('SSE','STREAM DEAD — MAX RETRIES','crit');};}
+function connect(){if(evt)evt.close();setConn('wait');evt=new EventSource('/sse');evt.onopen=()=>{setConn('live');reconnects=0;addLog('SSE','STREAM ESTABLISHED','info');};evt.onmessage=e=>{try{const d=JSON.parse(e.data);if(d.type==='alert'){handleAlertEvent(d);return;}if(d.type==='full'){if(window._replayMode)return;if(d.operator)updateOp(d.operator);updateDisplay(d.aps);if(d.geo)document.getElementById('local-db-cnt').textContent=d.geo.localBssids;if(d.survey){const op=d.operator||{};ingestSurvey(d.aps,op.lat,op.lon,d.survey.readings);if(d.survey.active&&!surveyMode){document.getElementById('btn-survey').classList.add('active');document.getElementById('survey-legend').classList.add('active');surveyMode=true;}}}}catch(err){addLog('ERR','PARSE: '+err.message,'crit');}};evt.onerror=()=>{setConn('disc');evt.close();if(reconnects<10){reconnects++;addLog('SSE','RECONNECT '+reconnects+'/10...','warn');setTimeout(connect,2000+reconnects*500);}else addLog('SSE','STREAM DEAD — MAX RETRIES','crit');};}
 connect();setInterval(()=>{if(evt&&evt.readyState===EventSource.CLOSED)connect();},30000);
 function updateOp(op){if(!op)return;if(op.gps&&!gpsLocked){gpsLocked=true;addLog('GPS','HARDWARE LOCK: '+op.lat.toFixed(5)+','+op.lon.toFixed(5),'info');const pill=document.getElementById('gps-pill');pill.className='hdr-gps live';document.getElementById('gps-txt').textContent='GPS: LOCKED';}if(op.gps||!opMarker){updateOpMarker(op.lat,op.lon,op.gps);if(op.gps)map.panTo([op.lat,op.lon],{animate:true,duration:0.5});}}
 """;
@@ -1299,7 +2155,7 @@ function surveyClear(){fetch('/api/v1/survey',{method:'POST',headers:authHeaders
 function ingestSurvey(aps,opLat,opLon,serverCount){document.getElementById('survey-cnt').textContent=serverCount;document.getElementById('survey-reading-lbl').textContent=serverCount+' READINGS';surveyReadings=serverCount;if(!surveyMode||!opLat||!opLon)return;for(const[k,ap]of Object.entries(aps)){if(!surveyData[k])surveyData[k]={ssid:ap.ssid||k,readings:[],color:PALETTE[paletteIdx++%PALETTE.length],visible:true};surveyData[k].ssid=ap.ssid||k;const last=surveyData[k].readings[surveyData[k].readings.length-1];if(last&&Math.hypot(opLat-last.lat,opLon-last.lon)<0.00003)continue;surveyData[k].readings.push({lat:opLat,lon:opLon,rssi:ap.signal});drawHeatPt(k,opLat,opLon,ap.signal);}renderSurveyLegend();}
 function drawHeatPt(bssid,lat,lon,rssi){if(!surveyData[bssid]||!surveyData[bssid].visible)return;const col=surveyData[bssid].color;const alpha=rssi>-55?0.7:rssi>-70?0.5:0.3;const r=rssi>-55?20:rssi>-70?14:9;const c=L.circleMarker([lat,lon],{radius:r,color:col,fillColor:col,fillOpacity:alpha,weight:0}).addTo(map);c.bindTooltip(`<span style="font-family:'Share Tech Mono';font-size:9px;color:${col}">${surveyData[bssid].ssid}<br>${rssi} dBm</span>`,{sticky:true});if(!heatLayers[bssid])heatLayers[bssid]=[];heatLayers[bssid].push(c);}
 function renderSurveyLegend(){const cont=document.getElementById('survey-ap-list');cont.innerHTML='';for(const[bssid,d]of Object.entries(surveyData)){if(d.readings.length===0)continue;const row=document.createElement('div');row.className='survey-row';row.style.color=d.visible?d.color:'#3a2800';row.innerHTML=`<div class="survey-dot" style="background:${d.visible?d.color:'#3a2800'};border:1px solid ${d.color};"></div><span style="flex:1;">${d.ssid!=='<hidden>'?d.ssid:bssid.slice(-8)}</span><span style="color:#3a2800;">${d.readings.length}</span>`;row.onclick=()=>{d.visible=!d.visible;(heatLayers[bssid]||[]).forEach(l=>{if(d.visible)map.addLayer(l);else map.removeLayer(l);});renderSurveyLegend();};cont.appendChild(row);}}
-function toggleAlertPanel(){alertOpen=!alertOpen;document.getElementById('alert-panel').classList.toggle('open',alertOpen);document.getElementById('btn-alerts').classList.toggle('active',alertOpen);if(alertOpen)loadAlertRules();}
+function toggleAlertPanel(){const next=!alertOpen;if(isMobileDash()&&next)closeMobileDrawers();alertOpen=next;document.getElementById('alert-panel').classList.toggle('open',alertOpen);document.getElementById('btn-alerts').classList.toggle('active',alertOpen);syncDrawerBackdrop();if(alertOpen)loadAlertRules();}
 function loadAlertRules(){fetch('/api/v1/alerts',{headers:authHeaders()}).then(r=>r.json()).then(rules=>renderAlertRules(rules)).catch(()=>{});}
 function renderAlertRules(rules){const el=document.getElementById('alert-rule-list');el.innerHTML='';if(!rules.length){el.innerHTML='<div style="padding:8px 14px;font-size:8px;color:#3a2800;letter-spacing:2px;">NO RULES</div>';return;}rules.forEach(r=>{const row=document.createElement('div');row.className='rule-row';row.innerHTML=`<div style="flex:1;"><div class="rule-type">${r.type.toUpperCase()}</div><div class="rule-pattern">${r.pattern||'(any)'}</div></div><button class="rule-del" onclick="deleteAlertRule('${r.id}')">&#x2715;</button>`;el.appendChild(row);});}
 function addAlertRule(){const type=document.getElementById('alert-type-sel').value;const pattern=document.getElementById('alert-pattern-inp').value.trim();fetch('/api/v1/alerts',{method:'POST',headers:authHeaders({'Content-Type':'application/json'}),body:JSON.stringify({type,pattern})}).then(()=>{loadAlertRules();document.getElementById('alert-pattern-inp').value='';addLog('ALERT','RULE ADDED: '+type,'warn');});}
@@ -1314,6 +2170,25 @@ function updateTriStatus(){for(let i=0;i<3;i++)document.getElementById('tri-d'+i
 function triMark(){const sel=document.getElementById('tri-ap-sel');if(!sel.value){addLog('TRI','SELECT AP FIRST','crit');return;}triBssid=sel.value;const ap=allAps[triBssid];if(!ap){addLog('TRI','AP NOT IN SCAN','crit');return;}if(!window._opLat){addLog('TRI','NO GPS FIX','crit');return;}triPts.push({lat:window._opLat,lon:window._opLon,rssi:ap.signal});addLog('TRI','PT '+'ABC'[triPts.length-1]+' @ '+window._opLat.toFixed(4)+','+window._opLon.toFixed(4),'info');if(triPts.length===3)computeTri(ap);else updateTriStatus();}
 function computeTri(ap){updateTriStatus();const TX=-30,N=2.8;const pts=triPts.map(p=>({lat:p.lat,lon:p.lon,d:Math.pow(10,(TX-p.rssi)/(10*N))}));const cLat=(pts[0].lat+pts[1].lat+pts[2].lat)/3,cLon=(pts[0].lon+pts[1].lon+pts[2].lon)/3;const toXY=p=>({x:(p.lon-cLon)*111320*Math.cos(cLat*Math.PI/180),y:(p.lat-cLat)*111320,d:p.d});const[A,B,C]=pts.map(toXY);const bx=2*(B.x-A.x),by=2*(B.y-A.y),cx=2*(C.x-A.x),cy=2*(C.y-A.y);const br=A.d*A.d-B.d*B.d-A.x*A.x+B.x*B.x-A.y*A.y+B.y*B.y;const cr=A.d*A.d-C.d*C.d-A.x*A.x+C.x*C.x-A.y*A.y+C.y*C.y;const det=bx*cy-by*cx;if(Math.abs(det)<1e-10){document.getElementById('tri-status').textContent='COLLINEAR — REPOSITION';triPts.length=0;updateTriStatus();return;}const estX=(br*cy-cr*by)/det,estY=(bx*cr-cx*br)/det;const estLat=cLat+estY/111320,estLon=cLon+estX/(111320*Math.cos(cLat*Math.PI/180));if(triMarker)map.removeLayer(triMarker);const col='#c41e0a';triMarker=L.circleMarker([estLat,estLon],{radius:12,color:col,fillColor:col,fillOpacity:0.4,weight:2}).addTo(map);triMarker.bindPopup(`<div style="background:#0e0c09;border:1px solid #c41e0a;padding:10px;font-family:'Share Tech Mono';font-size:9px;color:#ff8c00;min-width:200px;"><div style="font-family:'Big Shoulders Display';font-size:14px;font-weight:700;letter-spacing:4px;color:#c41e0a;margin-bottom:6px;">TRILATERATION FIX</div>${ap.ssid||'HIDDEN'}<br>EST: ${estLat.toFixed(6)}, ${estLon.toFixed(6)}<br><span style="color:#3a2800;font-size:8px;">3-point RSSI method — accuracy varies</span></div>`).openPopup();map.setView([estLat,estLon],17);document.getElementById('tri-status').textContent='FIX: '+estLat.toFixed(5)+', '+estLon.toFixed(5);addLog('TRI','FIX \\u2192 '+estLat.toFixed(4)+','+estLon.toFixed(4),'info');triPts.length=0;triActive=false;document.getElementById('tri-panel').classList.remove('active');document.getElementById('btn-tri').classList.remove('active');}
 (async()=>{const sleep=ms=>new Promise(r=>setTimeout(r,ms));const boot=document.getElementById('boot');const fill=document.getElementById('boot-bar-fill');const pct=document.getElementById('boot-pct');const log=document.getElementById('boot-log');for(let p=0;p<=100;p++){fill.style.width=p+'%';pct.textContent=p+'%';await sleep(12);}await sleep(300);log.style.display='block';const lines=[{tag:'SYS',cls:'sys',msg:'BLACK ICE v2 — SIGINT SURVEILLANCE PLATFORM',st:'',d:60},{tag:'SYS',cls:'sys',msg:'NIGHTFALL35 RESEARCH DIV // LUSAKA NODE',st:'',d:40},{tag:'INIT',cls:'ok',msg:'IEEE OUI DATABASE LOADED (38,847 entries)',st:'ok',d:100},{tag:'PCAP',cls:'ok',msg:'NPCAP 1.79 — MONITOR MODE DRIVER ARMED',st:'ok',d:120},{tag:'GPS',cls:'warn',msg:'COM3 9600 BAUD — SEEKING NMEA LOCK...',st:'warn',d:200},{tag:'HTTP',cls:'ok',msg:'ENTERPRISE API SERVER ON PORT 8080',st:'ok',d:80},{tag:'SSE',cls:'ok',msg:'EVENT STREAM ARMED (1Hz BROADCAST)',st:'ok',d:70},{tag:'GEO',cls:'ok',msg:'WIGLE GEOLOCATION ENGINE READY',st:'ok',d:80},{tag:'AI',cls:'ok',msg:'SWARM INTELLIGENCE MODULE ARMED',st:'ok',d:70},{tag:'AUTH',cls:'ok',msg:'BEARER TOKEN AUTH ACTIVE — SEE CONSOLE',st:'ok',d:80},{tag:'RADAR',cls:'ok',msg:'ROOM MODE PROXIMITY RADAR READY',st:'ok',d:60},{tag:'SURV',cls:'ok',msg:'WALK SURVEY / WARDRIVING ENGINE ARMED',st:'ok',d:60},{tag:'TRI',cls:'ok',msg:'TRILATERATION ENGINE READY — 3-POINT FIX',st:'ok',d:60},{tag:'ALERT',cls:'ok',msg:'RULES ENGINE ARMED — ssid_disappears FIRES',st:'ok',d:60},{tag:'SYS',cls:'ok',msg:'ALL SYSTEMS NOMINAL — ENTERING SURVEILLANCE',st:'ok',d:80},];for(const l of lines){const row=document.createElement('div');row.className='boot-log-line';const sc=l.cls==='ok'?'ok':l.cls==='warn'?'warn':l.cls==='info'?'info':'sys';const st=l.st?`<span class="bll-status ${l.st}">${l.st.toUpperCase()}</span>`:'';row.innerHTML=`<span class="bll-tag ${sc}">[${l.tag}]</span><span class="bll-msg">${l.msg}</span>${st}`;log.appendChild(row);log.scrollTop=log.scrollHeight;await sleep(l.d);}await sleep(500);log.style.display='none';document.querySelector('.boot-logo').style.display='none';document.querySelector('.boot-sub').style.display='none';document.querySelector('.boot-bar-wrap').style.display='none';document.querySelector('.boot-pct').style.display='none';const granted=document.querySelector('.boot-granted');granted.classList.add('show');await sleep(1000);boot.classList.add('gone');await sleep(800);boot.style.display='none';})();
+
+let replayOpen=false,replaySnaps=[],replayIdx=0,replayTimer=null,replaySpeed=4,replayId=null;
+window._replayMode=false;
+function replayQs(){return '?token='+encodeURIComponent(window.API_TOKEN);}
+function toggleReplayPanel(){const next=!replayOpen;if(isMobileDash()&&next)closeMobileDrawers();replayOpen=next;document.getElementById('replay-panel').classList.toggle('open',replayOpen);document.getElementById('btn-replay').classList.toggle('active',replayOpen);syncDrawerBackdrop();if(replayOpen)refreshReplayList();}
+function fmtClock(ms){if(!ms)return '--:--:--';const d=new Date(ms);return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0');}
+function fmtDur(ms){ms=Math.max(0,ms|0);const s=Math.floor(ms/1000);const h=Math.floor(s/3600);const m=Math.floor((s%3600)/60);const sec=s%60;if(h>0)return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0');return String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0');}
+async function refreshReplayList(){try{const r=await fetch('/api/v1/sessions'+replayQs(),{headers:authHeaders()});if(!r.ok)throw new Error('HTTP '+r.status);const data=await r.json();const rec=document.getElementById('replay-rec');if(data.recording){rec.className='replay-rec on';rec.textContent='REC ●  EVERY '+(data.intervalSec||'?')+'s'+(data.activeFile?'  '+data.activeFile:'');}else{rec.className='replay-rec';rec.textContent='REC: IDLE — launch with --session-log to record';}const sel=document.getElementById('replay-sel');const keep=sel.value;sel.innerHTML='<option value="">-- select session --</option>';(data.sessions||[]).forEach(s=>{const o=document.createElement('option');o.value=s.id;o.textContent=s.id+'  ('+(s.snapshots||0)+' snaps, '+(s.aps||0)+' APs)';sel.appendChild(o);});if(keep)sel.value=keep;if(!(data.sessions||[]).length){document.getElementById('replay-meta').textContent='No session files in sessions/. Enable recording, run a scan, then refresh.';}}catch(err){addLog('REPLAY','LIST FAILED: '+err.message,'crit');document.getElementById('replay-meta').textContent='Could not list sessions: '+err.message;}}
+async function loadReplaySession(){const id=document.getElementById('replay-sel').value;if(!id){return;}stopReplayTimer();try{addLog('REPLAY','LOADING '+id+'...','info');const r=await fetch('/api/v1/sessions/'+encodeURIComponent(id)+replayQs(),{headers:authHeaders()});if(!r.ok)throw new Error('HTTP '+r.status);const data=await r.json();replaySnaps=data.snapshots||[];replayId=data.id||id;if(!replaySnaps.length){document.getElementById('replay-meta').textContent='Session is empty.';addLog('REPLAY','EMPTY SESSION','warn');return;}window._replayMode=true;setConn('replay');replayIdx=0;const slider=document.getElementById('replay-slider');slider.disabled=false;slider.max=String(replaySnaps.length-1);slider.value='0';const first=replaySnaps[0],last=replaySnaps[replaySnaps.length-1];const dur=(last.t||0)-(first.t||0);document.getElementById('replay-meta').textContent=replayId+' — '+replaySnaps.length+' snapshots, '+fmtDur(dur)+' recorded.';applyReplayIdx(0,true);addLog('REPLAY','LOADED '+replaySnaps.length+' SNAPSHOTS — '+fmtDur(dur),'info');}catch(err){addLog('REPLAY','LOAD FAILED: '+err.message,'crit');document.getElementById('replay-meta').textContent='Load failed: '+err.message;}}
+function normalizeReplayAps(snap){const src=snap.aps||{};const out={};const list=Array.isArray(src)?src:Object.keys(src).map(k=>Object.assign({_key:k},src[k]));for(const ap of list){const k=ap.bssid||ap._key||ap.ssid;if(k)out[k]=ap;}return out;}
+function applyReplayIdx(i,hush){if(!replaySnaps.length)return;i=Math.max(0,Math.min(replaySnaps.length-1,i|0));replayIdx=i;const snap=replaySnaps[i];const aps=normalizeReplayAps(snap);if(snap.operator&&typeof snap.operator.lat==='number'&&typeof snap.operator.lon==='number'){updateOpMarker(snap.operator.lat,snap.operator.lon,!!snap.operator.gps);window._opLat=snap.operator.lat;window._opLon=snap.operator.lon;}const plot={};for(const[k,ap]of Object.entries(aps)){if(typeof ap.lat==='number'&&typeof ap.lon==='number')plot[k]=ap;}const savedAdd=addLog;if(hush)addLog=function(){};updateDisplay(plot);if(hush)addLog=savedAdd;allAps=aps;const total=Object.keys(aps).length;document.getElementById('cnt').textContent=String(total).padStart(3,'0');const openCount=Object.values(aps).filter(a=>isOpenNet(a)).length;document.getElementById('ocnt').textContent=openCount;if(panelOpen)renderPanel();if(chanOpen)drawChannelChart(aps);const slider=document.getElementById('replay-slider');if(document.activeElement!==slider)slider.value=String(i);const t=snap.t||0;document.getElementById('replay-clock').textContent=fmtClock(t);const first=replaySnaps[0].t||t;const last=replaySnaps[replaySnaps.length-1].t||t;document.getElementById('replay-clock-sub').textContent=fmtDur(t-first)+' / '+fmtDur(last-first)+'   SNAP '+(i+1)+'/'+replaySnaps.length;}
+function scrubReplay(v){if(!replaySnaps.length)return;stopReplayTimer();syncReplayPlayBtn(false);if(!window._replayMode){window._replayMode=true;setConn('replay');}applyReplayIdx(Number(v),true);}
+function stopReplayTimer(){if(replayTimer){clearTimeout(replayTimer);replayTimer=null;}}
+function syncReplayPlayBtn(playing){const b=document.getElementById('replay-play');if(!b)return;b.innerHTML=playing?'&#10074;&#10074; PAUSE':'&#9654; PLAY';b.classList.toggle('active',playing);}
+function toggleReplayPlay(){if(!replaySnaps.length){addLog('REPLAY','SELECT A SESSION FIRST','warn');return;}if(replayTimer){stopReplayTimer();syncReplayPlayBtn(false);return;}window._replayMode=true;setConn('replay');if(replayIdx>=replaySnaps.length-1)applyReplayIdx(0,true);syncReplayPlayBtn(true);addLog('REPLAY','PLAYBACK '+replaySpeed+'x','info');tickReplay();}
+function tickReplay(){if(!window._replayMode||!replaySnaps.length){syncReplayPlayBtn(false);return;}if(replayIdx>=replaySnaps.length-1){syncReplayPlayBtn(false);addLog('REPLAY','END OF SESSION','info');return;}const cur=replaySnaps[replayIdx].t||0;const next=replaySnaps[replayIdx+1].t||cur+1000;const wait=Math.max(40,Math.min(2500,(next-cur)/replaySpeed));replayTimer=setTimeout(()=>{replayTimer=null;applyReplayIdx(replayIdx+1,false);tickReplay();},wait);}
+function setReplaySpeed(s){replaySpeed=s;document.querySelectorAll('.replay-spd').forEach(b=>b.classList.toggle('active',Number(b.getAttribute('data-spd'))===s));if(replayTimer)addLog('REPLAY','SPEED '+s+'x','info');}
+function exitReplay(){stopReplayTimer();syncReplayPlayBtn(false);window._replayMode=false;if(evt&&evt.readyState===EventSource.OPEN)setConn('live');else setConn('wait');addLog('REPLAY','RETURNED TO LIVE FEED','info');document.getElementById('replay-meta').textContent=(replayId?replayId+' loaded. ':'')+'Live feed restored.';}
+
 function generateReport() {
   const site     = prompt('Site name:', 'Bank HQ');
   if (!site) return;
@@ -1328,6 +2203,31 @@ function generateReport() {
     '_blank'
   );
 }
+
+(function(){
+  const root=document.documentElement;
+  function syncChrome(){
+    const hdr=document.querySelector('.hdr');
+    const log=document.getElementById('log-strip');
+    const ctrl=document.querySelector('.ctrl-strip');
+    if(hdr)root.style.setProperty('--hdr-h', Math.round(hdr.getBoundingClientRect().height)+'px');
+    if(log)root.style.setProperty('--log-h', Math.round(log.getBoundingClientRect().height)+'px');
+    if(ctrl && isMobileDash())root.style.setProperty('--ctrl-h', Math.round(ctrl.getBoundingClientRect().height)+'px');
+    else root.style.setProperty('--ctrl-h','0px');
+    syncDrawerBackdrop();
+    if(typeof map!=='undefined' && map && map.invalidateSize){try{map.invalidateSize();}catch(e){}}
+  }
+  window.addEventListener('resize', syncChrome);
+  window.addEventListener('orientationchange', ()=>setTimeout(syncChrome, 250));
+  if(window.ResizeObserver){
+    const ro=new ResizeObserver(syncChrome);
+    const hdr=document.querySelector('.hdr');
+    const log=document.getElementById('log-strip');
+    if(hdr)ro.observe(hdr);
+    if(log)ro.observe(log);
+  }
+  syncChrome();
+})();
 </script></body></html>
 """;
     }

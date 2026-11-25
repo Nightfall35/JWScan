@@ -1,0 +1,39 @@
+# BLACK ICE v2 — headless Linux / Raspberry Pi survey node
+#
+# Host networking + NET_ADMIN/NET_RAW are required for libpcap to see the
+# host Wi-Fi adapter and open it in promiscuous/monitor mode.
+#
+#   docker compose up --build
+#
+# Dashboard: http://<host-ip>:8080  (API token is printed in the container logs)
+#
+# Optional flags (channel hop, session log, exports):
+#   command: ["8080", "--hop", "--session-log"]
+
+services:
+  blackice:
+    build: .
+    container_name: blackice
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      JAVA_TOOL_OPTIONS: -Djava.awt.headless=true
+    volumes:
+      - ./captures:/app/captures
+      - ./exports:/app/exports
+      - ./sessions:/app/sessions
+      - ./reports:/app/reports
+      # Uncomment to overlay local config / Wigle credentials (do not commit tokens):
+      # - ./Wigle_config.txt:/app/Wigle_config.txt:ro
+      # - ./gps_port.txt:/app/gps_port.txt:ro
+      # - ./hopper_config.txt:/app/hopper_config.txt:ro
+      # - ./pcap_config.txt:/app/pcap_config.txt:ro
+    # USB GPS dongle (typical CH340 / u-blox). Compose fails if the node is
+    # missing, so this is left commented — or pass --device at docker run time.
+    # devices:
+    #   - /dev/ttyUSB0:/dev/ttyUSB0
+    #   - /dev/ttyACM0:/dev/ttyACM0
+    command: ["8080"]
+    restart: unless-stopped

@@ -1,0 +1,20 @@
+# BLACK ICE v2 — historical session recording
+#
+# Periodically snapshot discovered APs (BSSID, SSID, signal, coordinates,
+# timestamp) to a JSONL file so the dashboard can replay a past survey
+# over time. Off by default. You can also enable this at launch (PowerShell):
+#   java -jar target\jwscan-2.0.0-jar-with-dependencies.jar 8080 --session-log
+#   java -jar target\jwscan-2.0.0-jar-with-dependencies.jar 8080 --record
+#
+# Replay does not need recording to be on: open the dashboard, click REPLAY,
+# and pick a previously saved file under sessions/.
+
+# 0 = off (default), 1 = record snapshots for this run
+enabled=0
+
+# Output directory (created automatically). Files are named:
+#   session_<yyyyMMdd_HHmmss>.jsonl
+dir=sessions
+
+# Seconds between snapshots. Minimum 1; default 5.
+interval_sec=5

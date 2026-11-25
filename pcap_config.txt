@@ -1,0 +1,12 @@
+# BLACK ICE v2 — PCAP export
+#
+# Write captured 802.11 frames to a .pcap file for offline analysis in Wireshark.
+# Off by default. You can also enable this at launch with --pcap (PowerShell):
+#   java -jar target\jwscan-2.0.0-jar-with-dependencies.jar 8080 --pcap
+
+# 0 = off (default), 1 = on
+enabled=0
+
+# Output directory (created automatically). Files are named:
+#   blackice_<yyyyMMdd_HHmmss>_<adapter>.pcap
+dir=captures

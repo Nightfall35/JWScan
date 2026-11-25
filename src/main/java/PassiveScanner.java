@@ -1,7 +1,12 @@
 import org.pcap4j.core.*;
 import org.pcap4j.packet.*;
+import java.nio.file.*;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * PassiveScanner — 802.11 frame capture via Npcap/pcap4j.
@@ -14,8 +19,19 @@ import java.util.concurrent.*;
  * 5. captureLoop() exception now logged with cause.
  * 6. Adapter filter accepts Microsoft WiFi Direct adapters.
  * 7. ChannelHopper wired in — started after handles open, stopped in stop().
- *    Channels are marked active every time a beacon is parsed so the smart
- *    hopper weights dwell time toward channels with real APs.
+ *    Opt-in and off by default: enable with --hop / --channel-hop or
+ *    hopper_config.txt (enabled=1). Dwell time, 5/6 GHz bands, and
+ *    strategy are read from hopper_config.txt. Channels are marked
+ *    active every time a beacon is parsed so the smart hopper weights
+ *    dwell time toward channels with real APs.
+ * 8. Optional PCAP export via PcapHandle.dumpOpen / PcapDumper. Off by default;
+ *    enable with --pcap or pcap_config.txt (enabled=1). Writes timestamped
+ *    captures/blackice_<timestamp>_<adapter>.pcap for Wireshark.
+ * 9. Always-on passive WPA/WPA2 4-way handshake detection: EAPOL-Key frames
+ *    in unencrypted 802.11 data are classified as messages 1/4–4/4 by Key
+ *    Information flags. Per-(BSSID, client) state tracks completion only
+ *    (no nonces, MICs, or key data are stored). A completed exchange is
+ *    counted on the AP and logged.
  */
 public class PassiveScanner implements AutoCloseable {
 
@@ -27,6 +43,33 @@ public class PassiveScanner implements AutoCloseable {
     // ── CHANGE 1: hopper field ───────────────────────────────────────────────
     private ChannelHopper hopper = null;
 
+    // ── PCAP export (off by default) ─────────────────────────────────────────
+    private boolean pcapExportEnabled = false;
+    private String  pcapDir = "captures";
+    private final List<PcapSink> pcapSinks = new ArrayList<>();
+    private final AtomicBoolean pcapDumpWarned = new AtomicBoolean(false);
+    private final AtomicLong eapolFrameCount = new AtomicLong();
+
+    // Passive 4-way handshake sessions: "BSSID|STA" → messages seen.
+    // Only a bit mask and timestamp are kept — never nonces, MICs, or key data.
+    private final ConcurrentHashMap<String, HsSession> hsSessions = new ConcurrentHashMap<>();
+    private static final long HS_SESSION_TTL_MS = 15_000L;
+
+    private static final class HsSession {
+        int mask;
+        long lastMs;
+    }
+
+    private static final class PcapSink {
+        final PcapDumper dumper;
+        final String path;
+        final AtomicLong packets = new AtomicLong();
+        PcapSink(PcapDumper dumper, String path) {
+            this.dumper = dumper;
+            this.path = path;
+        }
+    }
+
     public PassiveScanner(Rat rat) {
         this.rat = rat;
     }
@@ -34,11 +77,26 @@ public class PassiveScanner implements AutoCloseable {
     public void start() {
         List<PcapNetworkInterface> ifaces = getWifiInterfaces();
         if (ifaces.isEmpty()) {
-            rat.println("[SCANNER] No Wi-Fi interfaces found. Install Npcap and enable WinPcap-compatible mode.");
+            if (Rat.isLinuxOs()) {
+                rat.println("[SCANNER] No Wi-Fi interfaces found. On Linux: install libpcap0.8, run as root, and put a wireless adapter in monitor mode (wlan*, wlp*, wlx*).");
+            } else {
+                rat.println("[SCANNER] No Wi-Fi interfaces found. Install Npcap and enable WinPcap-compatible mode.");
+            }
             return;
         }
 
         running = true;
+        pcapExportEnabled = rat.isPcapExportCliEnabled() || readPcapConfigInt("enabled", 0) == 1;
+        pcapDir = readPcapConfigStr("dir", "captures");
+        if (pcapExportEnabled) {
+            try {
+                Files.createDirectories(Paths.get(pcapDir));
+            } catch (Exception e) {
+                rat.println("[PCAP] Could not create dump directory '" + pcapDir + "': " + e.getMessage());
+                pcapExportEnabled = false;
+            }
+        }
+
         rat.println("[SCANNER] Starting on " + ifaces.size() + " interface(s):");
 
         for (PcapNetworkInterface nif : ifaces) {
@@ -51,7 +109,8 @@ public class PassiveScanner implements AutoCloseable {
                 );
                 handles.add(handle);
                 final PcapNetworkInterface finalNif = nif;
-                pool.submit(() -> captureLoop(handle, finalNif.getName()));
+                final PcapSink sink = pcapExportEnabled ? openPcapDumper(handle, finalNif.getName()) : null;
+                pool.submit(() -> captureLoop(handle, finalNif.getName(), sink));
 
                 // Arm deauther on first valid interface
                 if (rat.getDeauther() == null) {
@@ -62,8 +121,10 @@ public class PassiveScanner implements AutoCloseable {
             }
         }
 
-        // ── CHANGE 2: Start channel hopper on first interface ────────────────
-        if (!ifaces.isEmpty()) {
+        // Start channel hopper on first interface (opt-in, off by default)
+        boolean hopEnabled = rat.isChannelHopCliEnabled()
+                || readHopperConfig("enabled", 0) == 1;
+        if (hopEnabled) {
             try {
                 int     dwellMs  = readHopperConfig("dwell_ms",   150);
                 boolean inc5GHz  = readHopperConfig("band_5ghz",    1) == 1;
@@ -78,6 +139,8 @@ public class PassiveScanner implements AutoCloseable {
                 rat.println("[HOPPER] Could not start channel hopper: " + e.getMessage());
                 hopper = null;
             }
+        } else {
+            rat.println("[HOPPER] Channel hopping off (enable with --hop or hopper_config.txt enabled=1)");
         }
     }
 
@@ -114,6 +177,77 @@ public class PassiveScanner implements AutoCloseable {
         return defaultValue;
     }
 
+    // ── PCAP export config ───────────────────────────────────────────────────
+    private int readPcapConfigInt(String key, int defaultValue) {
+        String raw = readPcapConfigRaw(key);
+        if (raw == null) return defaultValue;
+        try { return Integer.parseInt(raw); } catch (NumberFormatException e) { return defaultValue; }
+    }
+
+    private String readPcapConfigStr(String key, String defaultValue) {
+        String raw = readPcapConfigRaw(key);
+        return raw != null ? raw : defaultValue;
+    }
+
+    private String readPcapConfigRaw(String key) {
+        try {
+            Path f = Paths.get("pcap_config.txt");
+            if (!Files.exists(f)) return null;
+            for (String line : Files.readAllLines(f)) {
+                line = line.trim();
+                if (line.startsWith("#") || line.isEmpty()) continue;
+                String[] parts = line.split("=", 2);
+                if (parts.length == 2 && parts[0].trim().equals(key)) {
+                    return parts[1].trim();
+                }
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private PcapSink openPcapDumper(PcapHandle handle, String ifName) {
+        try {
+            String ts = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
+            String safeIf = ifName.replaceAll("[^A-Za-z0-9._-]", "_");
+            if (safeIf.isEmpty()) safeIf = "iface";
+            if (safeIf.length() > 48) safeIf = safeIf.substring(0, 48);
+            Path file = Paths.get(pcapDir, "blackice_" + ts + "_" + safeIf + ".pcap");
+            PcapDumper dumper = handle.dumpOpen(file.toString());
+            PcapSink sink = new PcapSink(dumper, file.toAbsolutePath().toString());
+            synchronized (pcapSinks) { pcapSinks.add(sink); }
+            rat.println("[PCAP] Dump started → " + sink.path);
+            return sink;
+        } catch (Exception e) {
+            rat.println("[PCAP] Failed to open dump file: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private void closePcapDumpers() {
+        synchronized (pcapSinks) {
+            for (PcapSink sink : pcapSinks) {
+                closeOneSink(sink);
+            }
+            pcapSinks.clear();
+        }
+    }
+
+    private void closeOneSink(PcapSink sink) {
+        if (sink == null || sink.dumper == null) return;
+        synchronized (sink) {
+            try {
+                if (sink.dumper.isOpen()) {
+                    try { sink.dumper.flush(); } catch (Exception ignored) {}
+                    sink.dumper.close();
+                    rat.println("[PCAP] Dump stopped → " + sink.path
+                            + " (" + sink.packets.get() + " packets)");
+                }
+            } catch (Exception e) {
+                rat.println("[PCAP] Error closing dump file: " + e.getMessage());
+            }
+        }
+    }
+
     // ── Interface filter ─────────────────────────────────────────────────────
     private List<PcapNetworkInterface> getWifiInterfaces() {
         List<PcapNetworkInterface> list = new ArrayList<>();
@@ -123,7 +257,12 @@ public class PassiveScanner implements AutoCloseable {
                 String name = nif.getName() != null ? nif.getName().toLowerCase() : "";
                 String desc = nif.getDescription() != null ? nif.getDescription().toLowerCase() : "";
 
+                // Windows: "Wi-Fi" / Npcap descriptions. Linux / Pi: wlan0,
+                // wlan0mon, wlp3s0 (predictable names), wlx… (USB adapters), mon0.
                 if (name.contains("wlan")
+                        || name.startsWith("wlp")
+                        || name.startsWith("wlx")
+                        || name.startsWith("mon")
                         || name.contains("wi-fi")
                         || desc.contains("wi-fi")
                         || desc.contains("wireless")
@@ -141,9 +280,23 @@ public class PassiveScanner implements AutoCloseable {
     }
 
     // ── Capture loop ─────────────────────────────────────────────────────────
-    private void captureLoop(PcapHandle handle, String ifName) {
+    private void captureLoop(PcapHandle handle, String ifName, PcapSink sink) {
         try {
             handle.loop(-1, (PacketListener) packet -> {
+                if (sink != null) {
+                    try {
+                        sink.dumper.dump(packet);
+                        if (sink.packets.incrementAndGet() % 50 == 0) {
+                            sink.dumper.flush();
+                        }
+                    } catch (Exception e) {
+                        if (pcapDumpWarned.compareAndSet(false, true)) {
+                            rat.println("[PCAP] Dump write failed: " + e.getMessage()
+                                    + " (further errors suppressed)");
+                        }
+                    }
+                }
+
                 if (!running) return;
 
                 RadiotapPacket radiotap = packet.get(RadiotapPacket.class);
@@ -161,6 +314,10 @@ public class PassiveScanner implements AutoCloseable {
                 int type    = (fc >> 2) & 0x3;
                 int subtype = (fc >> 4) & 0xF;
 
+                if (type == 2) {
+                    parseDataFrame(raw80211);
+                    return;
+                }
                 if (type != 0) return;
 
                 switch (subtype) {
@@ -173,6 +330,8 @@ public class PassiveScanner implements AutoCloseable {
             rat.println("[SCANNER] captureLoop error on " + ifName + ": "
                     + e.getMessage()
                     + (e.getCause() != null ? " (cause: " + e.getCause().getMessage() + ")" : ""));
+        } finally {
+            closeOneSink(sink);
         }
     }
 
@@ -321,6 +480,172 @@ public class PassiveScanner implements AutoCloseable {
         rat.onDeauthAttack(src, dst, 1);
     }
 
+    // ── Passive WPA/WPA2 4-way handshake detection (observe only) ────────────
+    // Looks at unencrypted 802.11 data frames for LLC/SNAP EtherType 0x888E
+    // (EAPOL) and classifies EAPOL-Key Key Information flags as messages 1–4.
+    // Group-key handshakes, encrypted frames, and non-Key EAPOL are ignored.
+    // No nonces, MICs, or key material are copied or stored.
+    private void parseDataFrame(byte[] raw) {
+        String[] macs = new String[2];
+        int msg = inspectEapolHandshake(raw, macs);
+        if (msg <= 0) return;
+
+        String bssid = macs[0];
+        String sta   = macs[1];
+        if (bssid == null || sta == null) return;
+
+        long now = System.currentTimeMillis();
+        String key = bssid + "|" + sta;
+        HsSession st = hsSessions.compute(key, (k, existing) -> {
+            if (existing == null || now - existing.lastMs > HS_SESSION_TTL_MS) {
+                return new HsSession();
+            }
+            return existing;
+        });
+
+        synchronized (st) {
+            // A new message-1 starts a fresh exchange (rekey or new association).
+            if (msg == 1 && st.mask != 0) {
+                st.mask = 0;
+            }
+            st.mask |= (1 << (msg - 1));
+            st.lastMs = now;
+            // Complete only when all four messages of this session were seen.
+            if (st.mask == 0x0F) {
+                st.mask = 0;
+                rat.onHandshakeComplete(bssid, sta);
+            }
+        }
+
+        if (eapolFrameCount.incrementAndGet() % 128 == 0) {
+            evictStaleHandshakeSessions(now);
+        }
+    }
+
+    /**
+     * Inspect an 802.11 data frame for a pairwise EAPOL-Key 4-way message.
+     * @return message number 1–4, or 0 if this is not a 4-way EAPOL-Key frame
+     * @param macs if length >= 2, filled with [BSSID, STA] on a hit
+     */
+    static int inspectEapolHandshake(byte[] raw, String[] macs) {
+        if (raw == null || raw.length < 24 + 8 + 7) return 0;
+
+        int fc0 = raw[0] & 0xFF;
+        int fc1 = raw[1] & 0xFF;
+        int type    = (fc0 >> 2) & 0x3;
+        int subtype = (fc0 >> 4) & 0xF;
+        if (type != 2) return 0;
+
+        // Protected bit set → payload is encrypted; handshake frames are not.
+        if ((fc1 & 0x40) != 0) return 0;
+
+        boolean toDs   = (fc1 & 0x01) != 0;
+        boolean fromDs = (fc1 & 0x02) != 0;
+        boolean qos    = (subtype & 0x08) != 0;
+        boolean order  = (fc1 & 0x80) != 0;
+
+        // 4-address (WDS) frames are not used for the 4-way handshake.
+        if (toDs && fromDs) return 0;
+
+        int hdr = 24;
+        if (qos) hdr += 2;
+        if (order && qos) hdr += 4; // HT Control when Order is set on a QoS data frame
+        if (hdr + 8 + 7 > raw.length) return 0;
+
+        // QoS A-MSDU present (bit 7 of QoS Control) is not an EAPOL frame.
+        if (qos) {
+            int qosCtrl = (raw[24] & 0xFF) | ((raw[25] & 0xFF) << 8);
+            if ((qosCtrl & 0x0080) != 0) return 0;
+        }
+
+        if (!isSnapEapol(raw, hdr)) return 0;
+
+        int eapol = hdr + 8;
+        int eapolType = raw[eapol + 1] & 0xFF;
+        if (eapolType != 3) return 0; // 3 = EAPOL-Key
+
+        int key = eapol + 4;
+        int descType = raw[key] & 0xFF;
+        // 1 = WPA (RC4), 2 = RSN/WPA2, 0xFE = WPA vendor descriptor
+        if (descType != 1 && descType != 2 && descType != 0xFE) return 0;
+
+        int keyInfo = ((raw[key + 1] & 0xFF) << 8) | (raw[key + 2] & 0xFF);
+        int msg = classifyPairwiseEapolKey(keyInfo);
+        if (msg <= 0) return 0;
+
+        if (macs != null && macs.length >= 2) {
+            if (fromDs && !toDs) {
+                // AP → STA: Addr2 = BSSID, Addr1 = STA
+                macs[0] = formatMacStatic(raw, 10);
+                macs[1] = formatMacStatic(raw, 4);
+            } else if (toDs && !fromDs) {
+                // STA → AP: Addr1 = BSSID, Addr2 = STA
+                macs[0] = formatMacStatic(raw, 4);
+                macs[1] = formatMacStatic(raw, 10);
+            } else {
+                // IBSS: Addr3 = BSSID, Addr2 = SA
+                macs[0] = formatMacStatic(raw, 16);
+                macs[1] = formatMacStatic(raw, 10);
+            }
+            if (isBroadcastOrEmpty(macs[0]) || isBroadcastOrEmpty(macs[1])) return 0;
+        }
+        return msg;
+    }
+
+    /** LLC/SNAP header with EtherType 0x888E (EAPOL). */
+    static boolean isSnapEapol(byte[] raw, int off) {
+        return off + 8 <= raw.length
+                && (raw[off]     & 0xFF) == 0xAA
+                && (raw[off + 1] & 0xFF) == 0xAA
+                && (raw[off + 2] & 0xFF) == 0x03
+                && (raw[off + 3] & 0xFF) == 0x00
+                && (raw[off + 4] & 0xFF) == 0x00
+                && (raw[off + 5] & 0xFF) == 0x00
+                && (raw[off + 6] & 0xFF) == 0x88
+                && (raw[off + 7] & 0xFF) == 0x8E;
+    }
+
+    /**
+     * Map EAPOL-Key Key Information flags to 4-way message 1–4.
+     * Returns 0 for group-key frames, requests, errors, or unrecognised combinations.
+     */
+    static int classifyPairwiseEapolKey(int keyInfo) {
+        final int KEYTYPE  = 0x0008;
+        final int ACK      = 0x0080;
+        final int MIC      = 0x0100;
+        final int SECURE   = 0x0200;
+        final int ERROR    = 0x0400;
+        final int REQUEST  = 0x0800;
+
+        if ((keyInfo & ERROR) != 0 || (keyInfo & REQUEST) != 0) return 0;
+        if ((keyInfo & KEYTYPE) == 0) return 0; // group handshake, not the 4-way
+
+        boolean ack    = (keyInfo & ACK)    != 0;
+        boolean mic    = (keyInfo & MIC)    != 0;
+        boolean secure = (keyInfo & SECURE) != 0;
+
+        if ( ack && !mic)                return 1;
+        if (!ack &&  mic && !secure)     return 2;
+        if ( ack &&  mic)                return 3;
+        if (!ack &&  mic &&  secure)     return 4;
+        return 0;
+    }
+
+    private static String formatMacStatic(byte[] raw, int offset) {
+        return String.format("%02X:%02X:%02X:%02X:%02X:%02X",
+                raw[offset], raw[offset+1], raw[offset+2],
+                raw[offset+3], raw[offset+4], raw[offset+5]);
+    }
+
+    private static boolean isBroadcastOrEmpty(String mac) {
+        if (mac == null || mac.isEmpty() || mac.equals("00:00:00:00:00:00")) return true;
+        return mac.equals("FF:FF:FF:FF:FF:FF");
+    }
+
+    private void evictStaleHandshakeSessions(long now) {
+        hsSessions.entrySet().removeIf(e -> now - e.getValue().lastMs > HS_SESSION_TTL_MS);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
     private String formatMac(byte[] raw, int offset) {
         return String.format("%02X:%02X:%02X:%02X:%02X:%02X",
@@ -343,9 +668,22 @@ public class PassiveScanner implements AutoCloseable {
         if (hopper != null) hopper.stop();
         for (PcapHandle h : handles) {
             try { h.breakLoop(); } catch (Exception ignored) {}
-            try { h.close();     } catch (Exception ignored) {}
         }
-        pool.shutdownNow();
+        pool.shutdown();
+        try {
+            if (!pool.awaitTermination(2, TimeUnit.SECONDS)) {
+                pool.shutdownNow();
+                pool.awaitTermination(1, TimeUnit.SECONDS);
+            }
+        } catch (InterruptedException e) {
+            pool.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+        hsSessions.clear();
+        closePcapDumpers();
+        for (PcapHandle h : handles) {
+            try { h.close(); } catch (Exception ignored) {}
+        }
     }
 
     @Override

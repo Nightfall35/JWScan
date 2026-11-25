@@ -34,6 +34,10 @@ import java.util.concurrent.*;
  *      GET  /api/v1/export/csv      — survey CSV
  *      GET  /api/v1/export/kml      — survey KML
  *      GET  /api/v1/export/gpx      — survey GPX
+ *      GET  /api/v1/export/aps.csv  — discovered-AP list as CSV (also written under exports/)
+ *      GET  /api/v1/export/aps.json — discovered-AP list as JSON (also written under exports/)
+ *      GET  /api/v1/sessions        — list recorded survey sessions (jsonl under sessions/)
+ *      GET  /api/v1/sessions/{id}   — one session's snapshots for dashboard replay
  *      GET  /sse                    — live event stream (auth required)
  *      GET  /                       — dashboard HTML (no auth — browser UI)
  *
@@ -226,6 +230,7 @@ public class EnterpriseApiServer {
             server.createContext("/api/v1/stats",   this::handleStats);
             server.createContext("/api/v1/alerts",  this::handleAlerts);
             server.createContext("/api/v1/export",  this::handleExport);
+            server.createContext("/api/v1/sessions", this::handleSessions);
             server.createContext("/api/v1/survey",  this::handleSurvey);
             
             server.createContext("/sse",            this::handleSse);
@@ -319,7 +324,21 @@ public class EnterpriseApiServer {
         if (!guard(ex, true)) return;
         String path = ex.getRequestURI().getPath();
         try {
-            if (path.endsWith("/csv")) {
+            if (path.endsWith("/aps.csv")) {
+                Rat.ApExportResult r = rat.dumpDiscoveredAps(true, false);
+                String name = r.csvPath != null ? r.csvPath.getFileName().toString() : "blackice_aps.csv";
+                ex.getResponseHeaders().set("Content-Type", "text/csv; charset=utf-8");
+                ex.getResponseHeaders().set("Content-Disposition", "attachment; filename=\"" + name + "\"");
+                ex.sendResponseHeaders(200, r.csvBytes.length);
+                ex.getResponseBody().write(r.csvBytes);
+            } else if (path.endsWith("/aps.json")) {
+                Rat.ApExportResult r = rat.dumpDiscoveredAps(false, true);
+                String name = r.jsonPath != null ? r.jsonPath.getFileName().toString() : "blackice_aps.json";
+                ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+                ex.getResponseHeaders().set("Content-Disposition", "attachment; filename=\"" + name + "\"");
+                ex.sendResponseHeaders(200, r.jsonBytes.length);
+                ex.getResponseBody().write(r.jsonBytes);
+            } else if (path.endsWith("/csv")) {
                 byte[] data = rat.exportCsv();
                 ex.getResponseHeaders().set("Content-Type", "text/csv");
                 ex.getResponseHeaders().set("Content-Disposition", "attachment; filename=\"survey.csv\"");
@@ -336,12 +355,37 @@ public class EnterpriseApiServer {
                 ex.sendResponseHeaders(200, data.length);
                 ex.getResponseBody().write(data);
             } else {
-                sendError(ex, 404, "Unknown export format. Use /csv, /kml, or /gpx");
+                sendError(ex, 404, "Unknown export format. Use /csv, /kml, /gpx, /aps.csv, or /aps.json");
             }
         } catch (Exception e) {
             sendError(ex, 500, "Export failed: " + e.getMessage());
         }
         ex.getResponseBody().close();
+    }
+
+
+    // ── /api/v1/sessions[/{id}] ──────────────────────────────────────────────
+    private void handleSessions(HttpExchange ex) throws IOException {
+        if (!guard(ex, true)) return;
+        if (!"GET".equals(ex.getRequestMethod())) {
+            sendError(ex, 405, "Method not allowed");
+            return;
+        }
+        String path = ex.getRequestURI().getPath();
+        if (path.equals("/api/v1/sessions") || path.equals("/api/v1/sessions/")) {
+            sendJson(ex, 200, rat.listSessionsJson());
+            return;
+        }
+        String id = path.substring("/api/v1/sessions/".length());
+        try {
+            id = URLDecoder.decode(id, StandardCharsets.UTF_8);
+        } catch (Exception ignored) {}
+        String body = rat.getSessionJson(id);
+        if (body == null) {
+            sendError(ex, 404, "Session not found: " + id);
+            return;
+        }
+        sendJson(ex, 200, body);
     }
 
     // ── /api/v1/survey ───────────────────────────────────────────────────────

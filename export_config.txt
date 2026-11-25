@@ -1,0 +1,22 @@
+# BLACK ICE v2 — discovered-AP list export
+#
+# Write the in-memory AP list to timestamped CSV/JSON files under exports/.
+# Off by default. You can also enable this at launch (PowerShell):
+#   java -jar target\jwscan-2.0.0-jar-with-dependencies.jar 8080 --export-csv --export-json
+#   java -jar target\jwscan-2.0.0-jar-with-dependencies.jar 8080 --export
+#
+# A snapshot is also available any time from the dashboard (AP CSV / AP JSON)
+# or GET /api/v1/export/aps.csv and /api/v1/export/aps.json, even if these
+# flags stay off.
+
+# 0 = off (default), 1 = write this format on shutdown (and periodically if set)
+csv=0
+json=0
+
+# Output directory (created automatically). Files are named:
+#   blackice_<yyyyMMdd_HHmmss>.csv
+#   blackice_<yyyyMMdd_HHmmss>.json
+dir=exports
+
+# Optional periodic flush in seconds. 0 = shutdown + manual only.
+interval_sec=0

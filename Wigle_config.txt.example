@@ -1,0 +1,5 @@
+# Copy this file to Wigle_config.txt and fill in your Wigle.net API credentials.
+# Get an API name and token from https://wigle.net (Account → API).
+# Do not commit Wigle_config.txt — it is gitignored.
+API_NAME=YOUR_WIGLE_API_NAME
+API_TOKEN=YOUR_WIGLE_API_TOKEN

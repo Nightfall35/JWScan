@@ -23,3 +23,7 @@ target/
 Thumbs.db
 .DS_Store
  
+# ── Runtime output ──
+captures/
+exports/
+sessions/
